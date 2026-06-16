@@ -36,6 +36,52 @@ CSV列:
 No, Result, Severity, CheckCode, CheckItem, Phase, File, Line, Message, Suggestion
 ```
 
+ビルドコンテキスト内の関連図は、既定で `docker-context-relations.mmd` にMermaid形式で出力します。Dockerfileからの `COPY` / `ADD`、`ENTRYPOINT`、シェルからの呼び出し、`jboss-cli --file` 参照をエッジとして書き出します。
+
+```bash
+./docker-context-checker.sh -c /path/to/context --mermaid relations.mmd
+./docker-context-checker.sh -c /path/to/context --no-mermaid
+```
+
+Dockerfileやシェルスクリプトで利用している変数の棚卸しは、既定で `docker-context-checker-variables.csv` にUTF-8 BOM付きCSVとして出力します。ARG、ENV、シェル変数、exportされた環境変数、外部から受け取る必要がある疑いの変数を、ファイル名、行数、設定値、利用形と一緒に出します。
+
+```bash
+./docker-context-checker.sh -c /path/to/context --variables-output variables.csv
+./docker-context-checker.sh -c /path/to/context --no-variables-output
+```
+
+変数CSV列:
+
+```text
+No, VariableName, Category, Action, Phase, File, Line, ConfiguredValue, Note
+```
+
+Dockerfileやシェルスクリプトでインストール/セットアップしているソフトウェアの棚卸しは、既定で `docker-context-checker-software.csv` にUTF-8 BOM付きCSVとして出力します。ベースイメージ、Javaバージョンの推定情報、パッケージマネージャで導入しているOSパッケージ、ダウンロード/展開しているアーカイブ、WildFly/JBoss設定、取り込んでいるJDBCドライバJARやjboss-cliのdriver設定を一覧化します。
+
+```bash
+./docker-context-checker.sh -c /path/to/context --software-output software.csv
+./docker-context-checker.sh -c /path/to/context --no-software-output
+```
+
+ソフトウェアCSV列:
+
+```text
+No, SoftwareName, Type, Version, SourceOrInstallMethod, Phase, File, Line, Evidence, Note
+```
+
+Java/JVMパラメータとWildFly/JBoss CLIサブシステム設定の監査結果は、既定で `docker-context-checker-config.csv` にUTF-8 BOM付きCSVとして出力します。Javaの `-Xmx`、`-XX:MaxRAMPercentage`、`-Dfile.encoding` などのJVMオプション、`JAVA_OPTS` / `JAVA_TOOL_OPTIONS` などの変数、CLIファイル内の `/subsystem=...:add(...)` や `:write-attribute(...)` の属性を一覧化し、設定項目の説明、実設定値、推奨設定、推奨との差分評価を出します。
+
+```bash
+./docker-context-checker.sh -c /path/to/context --config-output config.csv
+./docker-context-checker.sh -c /path/to/context --no-config-output
+```
+
+設定監査CSV列:
+
+```text
+No, Domain, Component, SettingItem, Description, ConfiguredValue, RecommendedSetting, DistanceFromRecommendation, Assessment, Phase, File, Line, Evidence
+```
+
 ## 主なチェック
 
 - マルチステージ `FROM ... AS ...` と `COPY --from=` の参照チェック

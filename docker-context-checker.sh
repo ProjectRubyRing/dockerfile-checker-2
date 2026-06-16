@@ -15,6 +15,14 @@ NO_COLOR=0
 PROGRESS=1
 REPORT_ENABLED=1
 REPORT_FILE=""
+MERMAID_ENABLED=1
+MERMAID_FILE=""
+VAR_REPORT_ENABLED=1
+VAR_REPORT_FILE=""
+SOFTWARE_REPORT_ENABLED=1
+SOFTWARE_REPORT_FILE=""
+CONFIG_REPORT_ENABLED=1
+CONFIG_REPORT_FILE=""
 
 declare -a F_SEV=()
 declare -a F_PHASE=()
@@ -54,6 +62,48 @@ declare -A CLI_REASON=()
 declare -A CLI_JNDI_SEEN=()
 declare -A MISSING_PATH_SEEN=()
 
+declare -a REL_FROM=()
+declare -a REL_TO=()
+declare -a REL_LABEL=()
+declare -a REL_PHASE=()
+declare -a REL_FILE=()
+declare -a REL_LINE=()
+declare -A REL_SEEN=()
+
+declare -a VAR_NAME=()
+declare -a VAR_CATEGORY=()
+declare -a VAR_ACTION=()
+declare -a VAR_FILE=()
+declare -a VAR_LINE=()
+declare -a VAR_VALUE=()
+declare -a VAR_PHASE=()
+declare -a VAR_NOTE=()
+
+declare -a SW_NAME=()
+declare -a SW_TYPE=()
+declare -a SW_VERSION=()
+declare -a SW_SOURCE=()
+declare -a SW_PHASE=()
+declare -a SW_FILE=()
+declare -a SW_LINE=()
+declare -a SW_EVIDENCE=()
+declare -a SW_NOTE=()
+declare -A SW_SEEN=()
+
+declare -a CFG_DOMAIN=()
+declare -a CFG_COMPONENT=()
+declare -a CFG_SETTING=()
+declare -a CFG_DESCRIPTION=()
+declare -a CFG_VALUE=()
+declare -a CFG_RECOMMENDED=()
+declare -a CFG_DISTANCE=()
+declare -a CFG_SEVERITY=()
+declare -a CFG_PHASE=()
+declare -a CFG_FILE=()
+declare -a CFG_LINE=()
+declare -a CFG_EVIDENCE=()
+declare -A CFG_SEEN=()
+
 FINAL_STAGE=-1
 FINAL_BASE=""
 FINAL_WORKDIR="/"
@@ -82,10 +132,25 @@ Options:
                            when it cannot be resolved from Dockerfile.
   -o, --output FILE        Write Excel-importable UTF-8 BOM CSV report.
                            Default: ./docker-context-checker-results.csv.
+      --mermaid FILE       Write build-context relationship diagram as Mermaid.
+                           Default: ./docker-context-relations.mmd.
+      --variables-output FILE
+                           Write Dockerfile/shell variable inventory CSV.
+                           Default: ./docker-context-checker-variables.csv.
+      --software-output FILE
+                           Write installed/setup software inventory CSV.
+                           Default: ./docker-context-checker-software.csv.
+      --config-output FILE Write Java/JBoss setting audit CSV.
+                           Default: ./docker-context-checker-config.csv.
       --include-unused-all Report every unreferenced file in the build context.
       --fail-on LEVEL      error, warn, or never. Default: error.
       --no-progress        Do not print phase-by-phase progress messages.
       --no-output          Do not write the CSV report file.
+      --no-mermaid         Do not write the Mermaid relationship diagram.
+      --no-variables-output
+                           Do not write the variable inventory CSV.
+      --no-software-output Do not write the software inventory CSV.
+      --no-config-output   Do not write the Java/JBoss setting audit CSV.
       --no-color           Disable ANSI colors.
   -h, --help               Show this help.
       --version            Show version.
@@ -177,6 +242,528 @@ add_finding() {
   F_COUNT[$sev]=$(( ${F_COUNT[$sev]:-0} + 1 ))
 }
 
+add_relation() {
+  local from="$1" to="$2" label="$3" phase="$4" file="$5" line="$6"
+  local key
+  [[ -z "$from" || -z "$to" ]] && return 0
+  [[ -z "$line" || "$line" == "0" ]] && line="-"
+  key="$from|$to|$label|$phase|$file|$line"
+  [[ -n "${REL_SEEN[$key]:-}" ]] && return 0
+  REL_SEEN["$key"]=1
+  REL_FROM+=("$from")
+  REL_TO+=("$to")
+  REL_LABEL+=("$label")
+  REL_PHASE+=("$phase")
+  REL_FILE+=("$file")
+  REL_LINE+=("$line")
+}
+
+add_var_record() {
+  local name="$1" category="$2" action="$3" file="$4" line="$5" value="$6" phase="$7" note="$8"
+  [[ -z "$name" ]] && return 0
+  [[ -z "$line" || "$line" == "0" ]] && line="-"
+  VAR_NAME+=("$name")
+  VAR_CATEGORY+=("$category")
+  VAR_ACTION+=("$action")
+  VAR_FILE+=("$file")
+  VAR_LINE+=("$line")
+  VAR_VALUE+=("$value")
+  VAR_PHASE+=("$phase")
+  VAR_NOTE+=("$note")
+}
+
+add_software_record() {
+  local name="$1" type="$2" version="$3" source="$4" phase="$5" file="$6" line="$7" evidence="$8" note="$9"
+  local key
+  [[ -z "$name" ]] && return 0
+  [[ -z "$line" || "$line" == "0" ]] && line="-"
+  key="$name|$type|$version|$source|$phase|$file|$line|$evidence"
+  [[ -n "${SW_SEEN[$key]:-}" ]] && return 0
+  SW_SEEN["$key"]=1
+  SW_NAME+=("$name")
+  SW_TYPE+=("$type")
+  SW_VERSION+=("$version")
+  SW_SOURCE+=("$source")
+  SW_PHASE+=("$phase")
+  SW_FILE+=("$file")
+  SW_LINE+=("$line")
+  SW_EVIDENCE+=("$evidence")
+  SW_NOTE+=("$note")
+}
+
+add_config_record() {
+  local domain="$1" component="$2" setting="$3" description="$4" value="$5" recommended="$6" distance="$7" severity="$8" phase="$9" file="${10}" line="${11}" evidence="${12}"
+  local key
+  [[ -z "$setting" ]] && return 0
+  [[ -z "$line" || "$line" == "0" ]] && line="-"
+  [[ -z "$value" ]] && value="(empty)"
+  [[ -z "$recommended" ]] && recommended="(context-dependent)"
+  [[ -z "$distance" ]] && distance="N/A"
+  [[ -z "$severity" ]] && severity="INFO"
+  key="$domain|$setting|$value|$file|$line"
+  [[ -n "${CFG_SEEN[$key]:-}" ]] && return 0
+  CFG_SEEN["$key"]=1
+  CFG_DOMAIN+=("$domain")
+  CFG_COMPONENT+=("$component")
+  CFG_SETTING+=("$setting")
+  CFG_DESCRIPTION+=("$description")
+  CFG_VALUE+=("$value")
+  CFG_RECOMMENDED+=("$recommended")
+  CFG_DISTANCE+=("$distance")
+  CFG_SEVERITY+=("$severity")
+  CFG_PHASE+=("$phase")
+  CFG_FILE+=("$file")
+  CFG_LINE+=("$line")
+  CFG_EVIDENCE+=("$evidence")
+}
+
+is_number() {
+  [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]
+}
+
+numeric_range_distance() {
+  local value="$1" min="$2" max="$3" unit="$4"
+  if ! is_number "$value"; then
+    printf 'Cannot compare: non-numeric value'
+  elif awk "BEGIN { exit !($value < $min) }"; then
+    awk "BEGIN { printf \"below recommended range by %.2f%s\", ($min - $value), \"$unit\" }"
+  elif awk "BEGIN { exit !($value > $max) }"; then
+    awk "BEGIN { printf \"above recommended range by %.2f%s\", ($value - $max), \"$unit\" }"
+  else
+    printf 'within recommended range'
+  fi
+}
+
+numeric_range_severity() {
+  local value="$1" min="$2" max="$3"
+  if ! is_number "$value"; then
+    printf 'WARN'
+  elif awk "BEGIN { exit !($value < $min || $value > $max) }"; then
+    printf 'WARN'
+  else
+    printf 'OK'
+  fi
+}
+
+bool_distance() {
+  local value="$1" recommended="$2"
+  local v r
+  v="$(lower "$value")"
+  r="$(lower "$recommended")"
+  case "$v" in
+    true|false) ;;
+    *) printf 'Cannot compare: non-boolean value'; return 0 ;;
+  esac
+  if [[ "$v" == "$r" ]]; then
+    printf 'matches recommended value'
+  else
+    printf 'differs from recommended value'
+  fi
+}
+
+bool_severity() {
+  local value="$1" recommended="$2"
+  [[ "$(lower "$value")" == "$(lower "$recommended")" ]] && printf 'OK' || printf 'WARN'
+}
+
+strip_shell_token() {
+  local token="$1"
+  token="${token%$'\r'}"
+  token="${token%,}"
+  token="${token%;}"
+  token="${token%\"}"
+  token="${token#\"}"
+  token="${token%\'}"
+  token="${token#\'}"
+  printf '%s' "$token"
+}
+
+image_tag_version() {
+  local image="$1"
+  if [[ "$image" == *":"* ]]; then
+    printf '%s' "${image##*:}"
+  else
+    printf 'latest/unspecified'
+  fi
+}
+
+infer_java_version_from_text() {
+  local text="$1" ltext
+  ltext="$(lower "$text")"
+  if [[ "$ltext" =~ (java|openjdk|jdk|jre)[^0-9]*(1\.8|8|11|17|21|22|23|24|25) ]]; then
+    printf '%s' "${BASH_REMATCH[2]}"
+  elif [[ "$ltext" =~ (1\.8|8|11|17|21|22|23|24|25)[^[:alnum:]]*(openjdk|jdk|jre) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  else
+    printf ''
+  fi
+}
+
+infer_db_driver_vendor() {
+  local name="$1" lname
+  lname="$(lower "$name")"
+  case "$lname" in
+    *ojdbc*|*oracle*) printf 'Oracle JDBC driver' ;;
+    *postgresql*|*pgsql*) printf 'PostgreSQL JDBC driver' ;;
+    *mysql-connector*|*mysql*j*) printf 'MySQL JDBC driver' ;;
+    *mariadb*) printf 'MariaDB JDBC driver' ;;
+    *mssql-jdbc*|*sqljdbc*|*sqlserver*) printf 'Microsoft SQL Server JDBC driver' ;;
+    *db2jcc*|*db2*) printf 'IBM DB2 JDBC driver' ;;
+    *h2-*.jar|*h2.jar) printf 'H2 JDBC driver' ;;
+    *hsqldb*) printf 'HSQLDB JDBC driver' ;;
+    *derby*) printf 'Apache Derby JDBC driver' ;;
+    *sqlite-jdbc*|*sqlite*) printf 'SQLite JDBC driver' ;;
+    *jtds*) printf 'jTDS JDBC driver' ;;
+    *snowflake*) printf 'Snowflake JDBC driver' ;;
+    *redshift*) printf 'Amazon Redshift JDBC driver' ;;
+    *terajdbc*|*tdgssconfig*|*teradata*) printf 'Teradata JDBC driver' ;;
+    *) printf '' ;;
+  esac
+}
+
+infer_version_from_filename() {
+  local name="$1" base version
+  base="$(basename -- "$name")"
+  version="$(sed -n 's/.*[-_]\([0-9][0-9A-Za-z.+_-]*\)\.jar$/\1/p' <<< "$base" | head -n 1)"
+  [[ -z "$version" ]] && version="$(sed -n 's/.*[-_]\([0-9][0-9A-Za-z.+_-]*\)\.\(tar\.gz\|tgz\|zip\|rpm\)$/\1/p' <<< "$base" | head -n 1)"
+  printf '%s' "$version"
+}
+
+is_java_option_variable() {
+  case "$1" in
+    JAVA_OPTS|JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|JVM_OPTS|JBOSS_JAVA_OPTS|JAVA_OPTS_APPEND|JAVA_OPTS_PREPEND|CATALINA_OPTS|MAVEN_OPTS|GRADLE_OPTS|JAVA_ARGS)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+java_param_description() {
+  local setting="$1"
+  case "$setting" in
+    -Xms) printf 'Initial Java heap size allocated when the JVM starts.' ;;
+    -Xmx) printf 'Maximum Java heap size. In containers this must fit inside the cgroup memory limit together with metaspace, thread stacks, direct memory, native memory, and the OS.' ;;
+    -Xss) printf 'Per-thread Java stack size. Larger values reduce the maximum practical thread count.' ;;
+    -XX:MaxRAMPercentage) printf 'Maximum percentage of container memory that the JVM may use for heap when explicit -Xmx is not set.' ;;
+    -XX:InitialRAMPercentage) printf 'Initial heap percentage of container memory when explicit -Xms is not set.' ;;
+    -XX:MinRAMPercentage) printf 'Minimum heap percentage used by JVM ergonomics for small memory limits.' ;;
+    -XX:MaxMetaspaceSize) printf 'Upper limit for class metadata memory. Too low can cause Metaspace OOM in WildFly deployments.' ;;
+    -XX:MetaspaceSize) printf 'Metaspace size threshold that triggers the first GC for class metadata.' ;;
+    -XX:MaxDirectMemorySize) printf 'Maximum off-heap direct buffer memory. Relevant for Undertow, NIO, database drivers, and messaging.' ;;
+    -XX:ReservedCodeCacheSize) printf 'JIT compiled code cache size.' ;;
+    -XX:UseContainerSupport) printf 'Enables JVM awareness of container cgroup CPU and memory limits.' ;;
+    -XX:UseG1GC) printf 'Enables the G1 garbage collector, commonly suitable for Java 11+ server workloads.' ;;
+    -XX:UseStringDeduplication) printf 'Enables String deduplication with G1GC to reduce heap usage when many duplicate strings exist.' ;;
+    -XX:HeapDumpOnOutOfMemoryError) printf 'Writes a heap dump when an OutOfMemoryError occurs.' ;;
+    -XX:HeapDumpPath) printf 'Path used for heap dump files.' ;;
+    -XX:ExitOnOutOfMemoryError) printf 'Terminates the JVM on OutOfMemoryError so the container orchestrator can restart it.' ;;
+    -XX:ErrorFile) printf 'Path pattern for fatal JVM error logs.' ;;
+    -Dfile.encoding) printf 'Default JVM file encoding used by APIs that do not specify an encoding.' ;;
+    -Duser.timezone) printf 'Default JVM timezone for date/time APIs that use the default zone.' ;;
+    -Djava.security.egd) printf 'Entropy source used by Java security APIs. Historically tuned to avoid blocking startup.' ;;
+    -Djboss.bind.address) printf 'WildFly/JBoss bind address for public interfaces.' ;;
+    -Djboss.bind.address.management) printf 'WildFly/JBoss bind address for the management interface.' ;;
+    -Djboss.server.config.dir) printf 'WildFly/JBoss server configuration directory.' ;;
+    -Djboss.server.log.dir) printf 'WildFly/JBoss server log directory.' ;;
+    -D*) printf 'Java system property passed to the JVM or application.' ;;
+    -server) printf 'Selects the server JVM mode where available.' ;;
+    --add-opens*) printf 'Opens a Java module/package reflectively for frameworks or legacy libraries.' ;;
+    *) printf 'Java/JVM parameter detected in Dockerfile or shell script.' ;;
+  esac
+}
+
+java_param_recommendation() {
+  local setting="$1"
+  case "$setting" in
+    -Xms) printf 'Prefer container-aware percentage sizing unless startup latency requires fixed heap. If fixed, ensure -Xms <= -Xmx.' ;;
+    -Xmx) printf 'Prefer -XX:MaxRAMPercentage=50-75 for containers, or set -Xmx below the container memory limit with headroom for non-heap memory.' ;;
+    -Xss) printf 'Use the smallest stack size validated by the application; commonly 256k-1m depending on workload.' ;;
+    -XX:MaxRAMPercentage) printf '50-75' ;;
+    -XX:InitialRAMPercentage) printf '10-25' ;;
+    -XX:MinRAMPercentage) printf '10-50' ;;
+    -XX:UseContainerSupport) printf 'true' ;;
+    -XX:UseG1GC) printf 'true for Java 11+ server workloads unless another GC is intentionally selected.' ;;
+    -XX:UseStringDeduplication) printf 'true only after measuring duplicate-string heap pressure with G1GC.' ;;
+    -XX:HeapDumpOnOutOfMemoryError) printf 'true, with HeapDumpPath pointing to writable storage if dumps are required.' ;;
+    -XX:ExitOnOutOfMemoryError) printf 'true for containerized services so failures are restarted cleanly.' ;;
+    -XX:MaxMetaspaceSize) printf 'Do not set too low; size from observed deployment metadata usage.' ;;
+    -XX:MetaspaceSize) printf 'Tune only from GC/metaspace observations; avoid unnecessary fixed values.' ;;
+    -XX:MaxDirectMemorySize) printf 'Set only when direct-memory usage must be bounded; include Undertow/NIO/driver requirements.' ;;
+    -XX:ReservedCodeCacheSize) printf 'Tune only if code cache warnings appear; otherwise keep JVM default.' ;;
+    -Dfile.encoding) printf 'UTF-8' ;;
+    -Duser.timezone) printf 'UTC or the explicit business timezone required by the application.' ;;
+    -Djava.security.egd) printf 'Modern Java usually needs no override; if set, prefer file:/dev/urandom.' ;;
+    -Djboss.bind.address) printf '0.0.0.0 in containers when the service must listen on the container network.' ;;
+    -Djboss.bind.address.management) printf 'Restrict management binding; avoid exposing 0.0.0.0 unless protected.' ;;
+    -server) printf 'server mode is normally appropriate for application servers.' ;;
+    --add-opens*) printf 'Use only for required compatibility; remove once dependencies support the Java module system.' ;;
+    -D*) printf 'Application-specific; verify against application and WildFly documentation.' ;;
+    *) printf 'Verify the option is supported by the Java version in the image.' ;;
+  esac
+}
+
+java_param_distance() {
+  local setting="$1" value="$2"
+  local v
+  v="${value%%%}"
+  case "$setting" in
+    -XX:MaxRAMPercentage)
+      numeric_range_distance "$v" 50 75 "%"
+      ;;
+    -XX:InitialRAMPercentage)
+      numeric_range_distance "$v" 10 25 "%"
+      ;;
+    -XX:MinRAMPercentage)
+      numeric_range_distance "$v" 10 50 "%"
+      ;;
+    -XX:UseContainerSupport|-XX:HeapDumpOnOutOfMemoryError|-XX:ExitOnOutOfMemoryError)
+      bool_distance "$value" "true"
+      ;;
+    -Dfile.encoding)
+      [[ "$(lower "$value")" == "utf-8" || "$(lower "$value")" == "utf8" ]] && printf 'matches recommended value' || printf 'differs from recommended UTF-8'
+      ;;
+    -Xmx|-Xms|-Xss|-XX:MaxMetaspaceSize|-XX:MetaspaceSize|-XX:MaxDirectMemorySize|-XX:ReservedCodeCacheSize)
+      printf 'Cannot compute without container memory limit and workload baseline'
+      ;;
+    *)
+      printf 'N/A or context-dependent'
+      ;;
+  esac
+}
+
+java_param_severity() {
+  local setting="$1" value="$2"
+  local v
+  v="${value%%%}"
+  case "$setting" in
+    -XX:MaxRAMPercentage)
+      numeric_range_severity "$v" 50 75
+      ;;
+    -XX:InitialRAMPercentage)
+      numeric_range_severity "$v" 10 25
+      ;;
+    -XX:MinRAMPercentage)
+      numeric_range_severity "$v" 10 50
+      ;;
+    -XX:UseContainerSupport|-XX:HeapDumpOnOutOfMemoryError|-XX:ExitOnOutOfMemoryError)
+      bool_severity "$value" "true"
+      ;;
+    -Dfile.encoding)
+      [[ "$(lower "$value")" == "utf-8" || "$(lower "$value")" == "utf8" ]] && printf 'OK' || printf 'WARN'
+      ;;
+    *) printf 'INFO' ;;
+  esac
+}
+
+record_java_parameter() {
+  local setting="$1" value="$2" source="$3" phase="$4" file="$5" line="$6" evidence="$7"
+  add_config_record "Java/JVM" "$source" "$setting" "$(java_param_description "$setting")" "$value" "$(java_param_recommendation "$setting")" "$(java_param_distance "$setting" "$value")" "$(java_param_severity "$setting" "$value")" "$phase" "$file" "$line" "$evidence"
+}
+
+scan_java_parameters() {
+  local text="$1" source="$2" phase="$3" file="$4" line="$5"
+  local token clean setting value prop
+  while IFS= read -r token; do
+    clean="$(strip_shell_token "$token")"
+    if [[ "$clean" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      clean="${clean#*=}"
+    fi
+    clean="$(strip_shell_token "$clean")"
+    case "$clean" in
+      -Xms*)
+        record_java_parameter "-Xms" "${clean#-Xms}" "$source" "$phase" "$file" "$line" "$text"
+        ;;
+      -Xmx*)
+        record_java_parameter "-Xmx" "${clean#-Xmx}" "$source" "$phase" "$file" "$line" "$text"
+        ;;
+      -Xss*)
+        record_java_parameter "-Xss" "${clean#-Xss}" "$source" "$phase" "$file" "$line" "$text"
+        ;;
+      -XX:+*)
+        setting="-XX:${clean#-XX:+}"
+        record_java_parameter "$setting" "true" "$source" "$phase" "$file" "$line" "$text"
+        ;;
+      -XX:-*)
+        setting="-XX:${clean#-XX:-}"
+        record_java_parameter "$setting" "false" "$source" "$phase" "$file" "$line" "$text"
+        ;;
+      -XX:*=*)
+        setting="${clean%%=*}"
+        value="${clean#*=}"
+        record_java_parameter "$setting" "$value" "$source" "$phase" "$file" "$line" "$text"
+        ;;
+      -D*=*)
+        prop="${clean%%=*}"
+        value="${clean#*=}"
+        record_java_parameter "$prop" "$value" "$source" "$phase" "$file" "$line" "$text"
+        ;;
+      -D*)
+        record_java_parameter "$clean" "(flag/no explicit value)" "$source" "$phase" "$file" "$line" "$text"
+        ;;
+      -server|--add-opens*|--add-exports*|--illegal-access=*)
+        setting="${clean%%=*}"
+        value=""
+        [[ "$clean" == *=* ]] && value="${clean#*=}"
+        [[ -z "$value" ]] && value="enabled"
+        record_java_parameter "$setting" "$value" "$source" "$phase" "$file" "$line" "$text"
+        ;;
+    esac
+  done < <(printf '%s\n' "$text" | tr '[:space:]' '\n')
+}
+
+record_context_software_artifact() {
+  local rel="$1" file="$2" line="$3" phase="$4" inst="$5"
+  local base vendor version java_version lname
+  base="$(basename -- "$rel")"
+  lname="$(lower "$base")"
+  version="$(infer_version_from_filename "$base")"
+
+  if [[ "$lname" == *.jar ]]; then
+    vendor="$(infer_db_driver_vendor "$base")"
+    if [[ -n "$vendor" ]]; then
+      add_software_record "$vendor" "database-driver-artifact" "$version" "$inst build-context artifact" "$phase" "$file" "$line" "$rel" "JDBC driver JAR copied or added from the build context."
+    elif [[ "$lname" == *wildfly* || "$lname" == *jboss* ]]; then
+      add_software_record "$base" "java-application-server-artifact" "$version" "$inst build-context artifact" "$phase" "$file" "$line" "$rel" "WildFly/JBoss related JAR artifact."
+    else
+      add_software_record "$base" "java-jar-artifact" "$version" "$inst build-context artifact" "$phase" "$file" "$line" "$rel" "JAR artifact copied or added from the build context."
+    fi
+  fi
+
+  if [[ "$lname" == *.war || "$lname" == *.ear ]]; then
+    add_software_record "$base" "java-deployment-artifact" "$version" "$inst build-context artifact" "$phase" "$file" "$line" "$rel" "Application deployment artifact copied or added from the build context."
+  fi
+
+  if [[ "$lname" == *wildfly* || "$lname" == *jboss-eap* ]]; then
+    add_software_record "$base" "application-server-artifact" "$version" "$inst build-context artifact" "$phase" "$file" "$line" "$rel" "WildFly/JBoss package or artifact copied from the build context."
+  fi
+
+  java_version="$(infer_java_version_from_text "$base")"
+  if [[ -n "$java_version" ]]; then
+    add_software_record "Java" "java-artifact" "$java_version" "$inst build-context artifact" "$phase" "$file" "$line" "$rel" "Java/JDK/JRE related artifact copied from the build context."
+  fi
+}
+
+record_installed_package() {
+  local pkg="$1" manager="$2" file="$3" line="$4" phase="$5" evidence="$6"
+  local clean version java_version lname vendor
+  clean="$(strip_shell_token "$pkg")"
+  [[ -z "$clean" || "$clean" == "-"* ]] && return 0
+  [[ "$clean" == "\\" ]] && return 0
+  case "$clean" in
+    install|update|upgrade|localinstall|reinstall|clean|all) return 0 ;;
+    "&&"|"||"|"|") return 0 ;;
+  esac
+  lname="$(lower "$clean")"
+  version=""
+  if [[ "$clean" == *"-"* ]]; then
+    version="$(sed -n 's/.*-\([0-9][0-9A-Za-z.+_:~-]*\)$/\1/p' <<< "$clean" | head -n 1)"
+  fi
+  add_software_record "$clean" "os-package" "$version" "$manager install" "$phase" "$file" "$line" "$evidence" "Package installed or requested by package manager."
+
+  java_version="$(infer_java_version_from_text "$clean")"
+  if [[ -n "$java_version" ]]; then
+    add_software_record "Java" "java-runtime-package" "$java_version" "$manager install package" "$phase" "$file" "$line" "$clean" "Java version inferred from installed package name."
+  fi
+
+  vendor="$(infer_db_driver_vendor "$clean")"
+  if [[ -n "$vendor" ]]; then
+    add_software_record "$vendor" "database-driver-package" "$version" "$manager install package" "$phase" "$file" "$line" "$clean" "Database/JDBC driver package inferred from package name."
+  fi
+
+  if [[ "$lname" == *wildfly* || "$lname" == *jboss* ]]; then
+    add_software_record "$clean" "application-server-package" "$version" "$manager install package" "$phase" "$file" "$line" "$clean" "WildFly/JBoss related package inferred from package name."
+  fi
+}
+
+scan_software_commands() {
+  local text="$1" file="$2" line="$3" phase="$4"
+  local -a words=()
+  local i j word cmd manager sub token url base version java_version lname
+  # shellcheck disable=SC2206
+  words=($text)
+  for ((i=0; i<${#words[@]}; i++)); do
+    word="$(strip_shell_token "${words[$i]}")"
+    cmd="$(basename -- "$word")"
+    lname="$(lower "$word")"
+    case "$cmd" in
+      dnf|yum|microdnf|apt|apt-get)
+        manager="$cmd"
+        if [[ $((i + 1)) -lt ${#words[@]} ]]; then
+          sub="$(strip_shell_token "${words[$((i + 1))]}")"
+          if [[ "$sub" == "install" || "$sub" == "localinstall" ]]; then
+            for ((j=i+2; j<${#words[@]}; j++)); do
+              token="$(strip_shell_token "${words[$j]}")"
+              case "$token" in
+                ""|";") break ;;
+                "&&"|"||"|"|") break ;;
+                -*) continue ;;
+              esac
+              record_installed_package "$token" "$manager" "$file" "$line" "$phase" "$text"
+            done
+          fi
+        fi
+        ;;
+      rpm)
+        if [[ $((i + 1)) -lt ${#words[@]} ]]; then
+          for ((j=i+1; j<${#words[@]}; j++)); do
+            token="$(strip_shell_token "${words[$j]}")"
+            case "$token" in
+              ""|";") break ;;
+              "&&"|"||"|"|") break ;;
+              -*) continue ;;
+            esac
+            if [[ "$token" == *.rpm ]]; then
+              base="$(basename -- "$token")"
+              version="$(infer_version_from_filename "$base")"
+              add_software_record "$base" "rpm-package-file" "$version" "rpm install" "$phase" "$file" "$line" "$text" "RPM file installed directly."
+            fi
+          done
+        fi
+        ;;
+      curl|wget)
+        for ((j=i+1; j<${#words[@]}; j++)); do
+          url="$(strip_shell_token "${words[$j]}")"
+          case "$url" in
+            http://*|https://*)
+              base="$(basename -- "$url")"
+              version="$(infer_version_from_filename "$base")"
+              add_software_record "$base" "downloaded-setup-artifact" "$version" "$cmd download" "$phase" "$file" "$line" "$url" "Remote artifact downloaded during build/runtime setup."
+              java_version="$(infer_java_version_from_text "$base")"
+              if [[ -n "$java_version" ]]; then
+                add_software_record "Java" "java-downloaded-artifact" "$java_version" "$cmd download" "$phase" "$file" "$line" "$url" "Java version inferred from downloaded artifact name."
+              fi
+              ;;
+          esac
+        done
+        ;;
+      tar|unzip)
+        for ((j=i+1; j<${#words[@]}; j++)); do
+          token="$(strip_shell_token "${words[$j]}")"
+          case "$token" in
+            *.tar.gz|*.tgz|*.zip)
+              base="$(basename -- "$token")"
+              version="$(infer_version_from_filename "$base")"
+              add_software_record "$base" "extracted-setup-artifact" "$version" "$cmd extraction" "$phase" "$file" "$line" "$text" "Archive extracted as part of setup."
+              ;;
+          esac
+        done
+        ;;
+      jboss-cli.sh|jboss-cli)
+        add_software_record "WildFly/JBoss CLI" "application-server-management-tool" "" "jboss-cli command" "$phase" "$file" "$line" "$text" "jboss-cli is used to configure WildFly/JBoss."
+        ;;
+      java)
+        if [[ "$text" == *"-version"* ]]; then
+          add_software_record "Java" "java-runtime-check" "" "java -version" "$phase" "$file" "$line" "$text" "Java runtime version is checked at build/runtime."
+        fi
+        ;;
+    esac
+    if [[ "$lname" == *wildfly* || "$lname" == *jboss-eap* ]]; then
+      version="$(infer_version_from_filename "$word")"
+      add_software_record "$(basename -- "$word")" "application-server-setup-reference" "$version" "command reference" "$phase" "$file" "$line" "$text" "WildFly/JBoss setup reference detected in command line."
+    fi
+  done
+}
+
 parse_args() {
   while (($#)); do
     case "$1" in
@@ -201,6 +788,30 @@ parse_args() {
         REPORT_ENABLED=1
         shift 2
         ;;
+      --mermaid)
+        [[ $# -ge 2 ]] || die "$1 requires a file"
+        MERMAID_FILE="$2"
+        MERMAID_ENABLED=1
+        shift 2
+        ;;
+      --variables-output)
+        [[ $# -ge 2 ]] || die "$1 requires a file"
+        VAR_REPORT_FILE="$2"
+        VAR_REPORT_ENABLED=1
+        shift 2
+        ;;
+      --software-output)
+        [[ $# -ge 2 ]] || die "$1 requires a file"
+        SOFTWARE_REPORT_FILE="$2"
+        SOFTWARE_REPORT_ENABLED=1
+        shift 2
+        ;;
+      --config-output)
+        [[ $# -ge 2 ]] || die "$1 requires a file"
+        CONFIG_REPORT_FILE="$2"
+        CONFIG_REPORT_ENABLED=1
+        shift 2
+        ;;
       --include-unused-all)
         INCLUDE_UNUSED_ALL=1
         shift
@@ -220,6 +831,22 @@ parse_args() {
         ;;
       --no-output)
         REPORT_ENABLED=0
+        shift
+        ;;
+      --no-mermaid)
+        MERMAID_ENABLED=0
+        shift
+        ;;
+      --no-variables-output)
+        VAR_REPORT_ENABLED=0
+        shift
+        ;;
+      --no-software-output)
+        SOFTWARE_REPORT_ENABLED=0
+        shift
+        ;;
+      --no-config-output)
+        CONFIG_REPORT_ENABLED=0
         shift
         ;;
       --version)
@@ -353,6 +980,16 @@ parse_from_instruction() {
   STAGE_NAME[$FINAL_STAGE]="$stage_name"
   STAGE_LINE[$FINAL_STAGE]="$line"
   STAGE_WORKDIR_FINAL[$FINAL_STAGE]="/"
+  add_software_record "$image" "container-base-image" "$(image_tag_version "$image")" "Dockerfile FROM${stage_name:+ AS $stage_name}" "build:stage-$FINAL_STAGE" "$DOCKERFILE_PATH" "$line" "$body" "Container base image used for this stage."
+  local java_version image_l
+  image_l="$(lower "$image")"
+  java_version="$(infer_java_version_from_text "$image")"
+  if [[ -n "$java_version" ]]; then
+    add_software_record "Java" "java-runtime-from-base-image" "$java_version" "Dockerfile FROM image tag/name" "build:stage-$FINAL_STAGE" "$DOCKERFILE_PATH" "$line" "$image" "Java version inferred from the base image name or tag."
+  fi
+  if [[ "$image_l" == *wildfly* || "$image_l" == *jboss* ]]; then
+    add_software_record "$image" "application-server-base-image" "$(image_tag_version "$image")" "Dockerfile FROM image tag/name" "build:stage-$FINAL_STAGE" "$DOCKERFILE_PATH" "$line" "$image" "WildFly/JBoss related base image."
+  fi
 
   if [[ -n "$stage_name" ]]; then
     local key
@@ -604,6 +1241,21 @@ validate_copy_from_reference() {
   fi
 }
 
+add_copy_relations() {
+  local full="$1" src_rel="$2" inst="$3" dest="$4" line="$5"
+  local child child_rel
+  if [[ -d "$full" && ! -L "$full" ]]; then
+    while IFS= read -r -d '' child; do
+      child_rel="$(rel_to_context "$child")"
+      add_relation "Dockerfile" "$child_rel" "$inst line $line -> $dest" "build-context" "$DOCKERFILE_PATH" "$line"
+      record_context_software_artifact "$child_rel" "$DOCKERFILE_PATH" "$line" "build-context" "$inst"
+    done < <(find "$full" -path '*/.git' -prune -o -type f -print0 -o -type l -print0)
+  else
+    add_relation "Dockerfile" "$src_rel" "$inst line $line -> $dest" "build-context" "$DOCKERFILE_PATH" "$line"
+    record_context_software_artifact "$src_rel" "$DOCKERFILE_PATH" "$line" "build-context" "$inst"
+  fi
+}
+
 parse_copy_add_instruction() {
   local inst="$1" body="$2" line="$3" stage="$4" workdir="$5"
   local prefix json_part word from="" skip_next=0 link=0
@@ -669,6 +1321,7 @@ parse_copy_add_instruction() {
       [[ -z "$full" ]] && continue
       src_rel="$(rel_to_context "$full")"
       mark_context_path_referenced "$full"
+      add_copy_relations "$full" "$src_rel" "$inst" "$dest" "$line"
       map_container_to_context_for_path "$full" "$src_rel" "$dest" "${#sources[@]}" "$workdir"
     done
   done
@@ -694,10 +1347,17 @@ extract_var_refs() {
           var=substr(expr,RSTART,RLENGTH)
           rest=substr(expr,RLENGTH+1)
           kind="plain"
-          if (rest ~ /^:-/ || rest ~ /^-/ || rest ~ /^:=/ || rest ~ /^=/) kind="default"
-          else if (rest ~ /^:\?/ || rest ~ /^\?/) kind="required"
-          else if (rest ~ /^:\+/ || rest ~ /^\+/) kind="alternate"
-          print var "|" kind
+          detail=""
+          if (rest ~ /^:-/) { kind="default"; detail=substr(rest,3) }
+          else if (rest ~ /^-/) { kind="default"; detail=substr(rest,2) }
+          else if (rest ~ /^:=/) { kind="default"; detail=substr(rest,3) }
+          else if (rest ~ /^=/) { kind="default"; detail=substr(rest,2) }
+          else if (rest ~ /^:\?/) { kind="required"; detail=substr(rest,3) }
+          else if (rest ~ /^\?/) { kind="required"; detail=substr(rest,2) }
+          else if (rest ~ /^:\+/) { kind="alternate"; detail=substr(rest,3) }
+          else if (rest ~ /^\+/) { kind="alternate"; detail=substr(rest,2) }
+          gsub(/\|/, "/", detail)
+          print var "|" kind "|" detail
         }
         i=j
       } else if (n ~ /[A-Za-z_]/) {
@@ -705,7 +1365,7 @@ extract_var_refs() {
         while (j<=length(s) && substr(s,j,1) ~ /[A-Za-z0-9_]/) {
           var=var substr(s,j,1); j++
         }
-        print var "|plain"
+        print var "|plain|"
         i=j-1
       }
     }
@@ -725,6 +1385,7 @@ parse_env_instruction() {
   local body="$1" line="$2"
   local -a words=()
   local word key value
+  scan_java_parameters "$body" "Dockerfile ENV" "build:dockerfile" "$DOCKERFILE_PATH" "$line"
   # shellcheck disable=SC2206
   words=($body)
   if (( ${#words[@]} == 0 )); then
@@ -737,6 +1398,21 @@ parse_env_instruction() {
       value="${words[*]:1}"
       DOCKER_ENV["$key"]="$value"
       DOCKER_ENV_LINE["$key"]="$line"
+      add_var_record "$key" "Dockerfile ENV" "define" "$DOCKERFILE_PATH" "$line" "$value" "build:dockerfile" "Legacy ENV key value form; exported into the image environment."
+      if is_java_option_variable "$key"; then
+        scan_java_parameters "$value" "Dockerfile ENV $key" "build:dockerfile" "$DOCKERFILE_PATH" "$line"
+      fi
+      case "$key" in
+        JAVA_VERSION|JDK_VERSION)
+          add_software_record "Java" "java-version-env" "$value" "Dockerfile ENV $key" "build:dockerfile" "$DOCKERFILE_PATH" "$line" "$body" "Java version configured through Dockerfile ENV."
+          ;;
+        JAVA_HOME)
+          add_software_record "Java" "java-home-env" "" "Dockerfile ENV JAVA_HOME" "build:dockerfile" "$DOCKERFILE_PATH" "$line" "$value" "Java home path configured through Dockerfile ENV."
+          ;;
+        JBOSS_HOME|WILDFLY_HOME)
+          add_software_record "WildFly/JBoss" "application-server-home-env" "" "Dockerfile ENV $key" "build:dockerfile" "$DOCKERFILE_PATH" "$line" "$value" "WildFly/JBoss home path configured through Dockerfile ENV."
+          ;;
+      esac
       add_finding "INFO" "build:dockerfile" "$DOCKERFILE_PATH" "$line" "VAR002" "ENV uses legacy 'key value' form; prefer key=value for predictable parsing."
     else
       add_finding "ERROR" "build:dockerfile" "$DOCKERFILE_PATH" "$line" "VAR003" "ENV '$body' has no value."
@@ -748,6 +1424,21 @@ parse_env_instruction() {
     value="${word#*=}"
     DOCKER_ENV["$key"]="$value"
     DOCKER_ENV_LINE["$key"]="$line"
+    add_var_record "$key" "Dockerfile ENV" "define" "$DOCKERFILE_PATH" "$line" "$value" "build:dockerfile" "ENV value exported into the image environment."
+    if is_java_option_variable "$key"; then
+      scan_java_parameters "$value" "Dockerfile ENV $key" "build:dockerfile" "$DOCKERFILE_PATH" "$line"
+    fi
+    case "$key" in
+      JAVA_VERSION|JDK_VERSION)
+        add_software_record "Java" "java-version-env" "$value" "Dockerfile ENV $key" "build:dockerfile" "$DOCKERFILE_PATH" "$line" "$word" "Java version configured through Dockerfile ENV."
+        ;;
+      JAVA_HOME)
+        add_software_record "Java" "java-home-env" "" "Dockerfile ENV JAVA_HOME" "build:dockerfile" "$DOCKERFILE_PATH" "$line" "$value" "Java home path configured through Dockerfile ENV."
+        ;;
+      JBOSS_HOME|WILDFLY_HOME)
+        add_software_record "WildFly/JBoss" "application-server-home-env" "" "Dockerfile ENV $key" "build:dockerfile" "$DOCKERFILE_PATH" "$line" "$value" "WildFly/JBoss home path configured through Dockerfile ENV."
+        ;;
+    esac
     if [[ -z "$value" || "$value" == '""' || "$value" == "''" ]]; then
       add_finding "WARN" "build:dockerfile" "$DOCKERFILE_PATH" "$line" "VAR004" "ENV '$key' is initialized as empty."
     fi
@@ -766,6 +1457,11 @@ parse_arg_instruction() {
   fi
   DOCKER_ARG["$key"]="$value"
   DOCKER_ARG_LINE["$key"]="$line"
+  if [[ "$part" == *=* ]]; then
+    add_var_record "$key" "Dockerfile ARG" "define" "$DOCKERFILE_PATH" "$line" "$value" "build:dockerfile" "Build argument default value."
+  else
+    add_var_record "$key" "Dockerfile ARG" "define" "$DOCKERFILE_PATH" "$line" "" "build:dockerfile" "No default; must be supplied with --build-arg when required."
+  fi
   if [[ "$part" != *=* ]]; then
     add_finding "WARN" "build:dockerfile" "$DOCKERFILE_PATH" "$line" "VAR006" "ARG '$key' has no default; it must be supplied by build-arg if required."
   fi
@@ -773,16 +1469,30 @@ parse_arg_instruction() {
 
 scan_dockerfile_var_use() {
   local text="$1" line="$2" phase="$3"
-  local use var kind
+  local use var rest kind detail category note
   while IFS= read -r use; do
     [[ -z "$use" ]] && continue
     var="${use%%|*}"
-    kind="${use#*|}"
+    rest="${use#*|}"
+    kind="${rest%%|*}"
+    detail=""
+    [[ "$rest" == *"|"* ]] && detail="${rest#*|}"
     DOCKER_VAR_USED["$var"]=1
+    if [[ -v DOCKER_ARG[$var] ]]; then
+      category="Dockerfile ARG reference"
+    elif [[ -v DOCKER_ENV[$var] ]]; then
+      category="Dockerfile ENV reference"
+    else
+      category="Dockerfile external/undefined variable"
+    fi
+    note="Variable reference in Dockerfile instruction."
+    [[ "$kind" == "default" ]] && note="Variable reference has inline default/assignment fallback."
+    [[ "$kind" == "required" ]] && note="Variable reference requires an external value."
+    add_var_record "$var" "$category" "$kind" "$DOCKERFILE_PATH" "$line" "$detail" "$phase" "$note"
     if [[ "$kind" == "required" ]]; then
       add_finding "WARN" "$phase" "$DOCKERFILE_PATH" "$line" "VAR007" "Dockerfile variable '$var' is required via parameter expansion."
     elif [[ "$kind" == "plain" || "$kind" == "alternate" ]]; then
-      if [[ -z "${DOCKER_ENV[$var]:-}" && -z "${DOCKER_ARG[$var]:-}" ]] && ! is_standard_env_var "$var"; then
+      if [[ ! -v DOCKER_ENV[$var] && ! -v DOCKER_ARG[$var] ]] && ! is_standard_env_var "$var"; then
         add_finding "WARN" "$phase" "$DOCKERFILE_PATH" "$line" "VAR008" "Dockerfile uses variable '$var' without an ARG/ENV definition or default."
       fi
     fi
@@ -900,6 +1610,7 @@ discover_shell_refs_in_text() {
           if [[ "$next" == *.sh* || "$next" == ./* || "$next" == /* ]]; then
             if rel="$(resolve_script_reference "$next" "$current_rel" "$line" "$phase" "$workdir")"; then
               add_shell_file "$rel" "called from $phase line $line"
+              add_relation "${current_rel:-Dockerfile}" "$rel" "calls line $line" "$phase" "$CONTEXT_DIR/$current_rel" "$line"
             else
               local key="$current_rel:$line:$next"
               if [[ -z "${MISSING_PATH_SEEN[$key]:-}" ]]; then
@@ -915,14 +1626,25 @@ discover_shell_refs_in_text() {
           next="${words[$((i + 1))]}"
           if rel="$(resolve_script_reference "$next" "$current_rel" "$line" "$phase" "$workdir")"; then
             add_shell_file "$rel" "sourced from $phase line $line"
+            add_relation "${current_rel:-Dockerfile}" "$rel" "sources line $line" "$phase" "$CONTEXT_DIR/$current_rel" "$line"
           else
             add_finding "WARN" "$phase" "$CONTEXT_DIR/$current_rel" "$line" "SH003" "Sourced shell file '$next' could not be resolved to a build-context file."
           fi
         fi
         ;;
       *.sh|*.sh\"|*.sh\')
+        if (( i > 0 )); then
+          local prev prev_base
+          prev="${words[$((i - 1))]}"
+          prev="${prev%%[;&|]*}"
+          prev_base="$(basename -- "$prev")"
+          case "$prev_base" in
+            sh|bash|ksh|source|.) continue ;;
+          esac
+        fi
         if rel="$(resolve_script_reference "$word" "$current_rel" "$line" "$phase" "$workdir")"; then
           add_shell_file "$rel" "referenced from $phase line $line"
+          add_relation "${current_rel:-Dockerfile}" "$rel" "references line $line" "$phase" "$CONTEXT_DIR/$current_rel" "$line"
         fi
         ;;
     esac
@@ -1038,6 +1760,8 @@ analyze_dockerfile() {
         parse_copy_add_instruction "$inst" "$body" "$line" "$stage" "$workdir"
         ;;
       RUN)
+        scan_software_commands "$body" "$DOCKERFILE_PATH" "$line" "build:stage-$stage"
+        scan_java_parameters "$body" "Dockerfile RUN" "build:stage-$stage" "$DOCKERFILE_PATH" "$line"
         if detect_symlink_command "$body"; then
           add_finding "INFO" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SYM001" "Symlink creation detected in Dockerfile RUN; this happens during image build, not container start."
         fi
@@ -1094,6 +1818,7 @@ resolve_entrypoint() {
     if [[ -f "$full" || -L "$full" ]]; then
       rel="$(rel_to_context "$full")"
       add_shell_file "$rel" "entrypoint override"
+      add_relation "Dockerfile" "$rel" "entrypoint override" "runtime:entrypoint" "$full" "-"
     else
       add_finding "ERROR" "runtime:entrypoint" "$full" "-" "EP001" "Entrypoint override file does not exist."
     fi
@@ -1104,6 +1829,7 @@ resolve_entrypoint() {
     if token="$(extract_entrypoint_script_token "$FINAL_ENTRYPOINT_BODY")"; then
       if rel="$(resolve_script_reference "$token" "" "$FINAL_ENTRYPOINT_LINE" "runtime:entrypoint" "$FINAL_WORKDIR")"; then
         add_shell_file "$rel" "Dockerfile ENTRYPOINT line $FINAL_ENTRYPOINT_LINE"
+        add_relation "Dockerfile" "$rel" "ENTRYPOINT line $FINAL_ENTRYPOINT_LINE" "runtime:entrypoint" "$DOCKERFILE_PATH" "$FINAL_ENTRYPOINT_LINE"
       else
         add_finding "WARN" "runtime:entrypoint" "$DOCKERFILE_PATH" "$FINAL_ENTRYPOINT_LINE" "EP002" "ENTRYPOINT '$token' could not be resolved to a build-context script. It may come from the base image or a generated file."
       fi
@@ -1114,6 +1840,7 @@ resolve_entrypoint() {
     if token="$(extract_entrypoint_script_token "$FINAL_CMD_BODY")"; then
       if rel="$(resolve_script_reference "$token" "" "$FINAL_CMD_LINE" "runtime:cmd" "$FINAL_WORKDIR")"; then
         add_shell_file "$rel" "Dockerfile CMD line $FINAL_CMD_LINE"
+        add_relation "Dockerfile" "$rel" "CMD line $FINAL_CMD_LINE" "runtime:cmd" "$DOCKERFILE_PATH" "$FINAL_CMD_LINE"
       fi
     fi
   else
@@ -1121,6 +1848,7 @@ resolve_entrypoint() {
     if [[ -n "$full" ]]; then
       rel="$(rel_to_context "$full")"
       add_shell_file "$rel" "entrypoint filename heuristic"
+      add_relation "Dockerfile" "$rel" "entrypoint filename heuristic" "runtime:entrypoint" "$full" "-"
       add_finding "INFO" "runtime:entrypoint" "$full" "-" "EP003" "No Dockerfile ENTRYPOINT found; scanning '$rel' by filename heuristic."
     else
       add_finding "INFO" "runtime:entrypoint" "$DOCKERFILE_PATH" "-" "EP004" "No ENTRYPOINT/CMD shell script could be resolved from the final stage."
@@ -1229,7 +1957,7 @@ scan_shell_file() {
   local -A first_use=()
   local -A literal_assign=()
   local -A exported=()
-  local line no=0 code assign var value use kind lcode cli_arg cli_rel
+  local line no=0 code assign var value use rest kind detail lcode cli_arg cli_rel category note java_assignment_var
   local -a literal_pairs=()
   local re_assign='(^|[[:space:];&|])(export|local|readonly)?[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)='
   local re_export='(^|[[:space:];&|])export[[:space:]]+'
@@ -1257,6 +1985,14 @@ scan_shell_file() {
     fi
 
     discover_shell_refs_in_text "$code" "$rel" "$no" "runtime:$rel" "$FINAL_WORKDIR"
+    scan_software_commands "$code" "$file" "$no" "runtime:$rel"
+    java_assignment_var=""
+    if [[ "$code" =~ $re_assign ]]; then
+      java_assignment_var="${BASH_REMATCH[3]}"
+    fi
+    if [[ -z "$java_assignment_var" ]] || ! is_java_option_variable "$java_assignment_var"; then
+      scan_java_parameters "$code" "shell command" "runtime:$rel" "$file" "$no"
+    fi
 
     if [[ "$code" =~ $re_assign ]]; then
       var="${BASH_REMATCH[3]}"
@@ -1265,6 +2001,25 @@ scan_shell_file() {
       value="${code#*=}"
       value="$(literal_value_from_assignment "$value")"
       literal_assign["$var"]="$value"
+      if is_java_option_variable "$var"; then
+        scan_java_parameters "$value" "shell variable $var" "runtime:$rel" "$file" "$no"
+      fi
+      if [[ -n "${exported[$var]:-}" ]]; then
+        add_var_record "$var" "Shell exported environment variable" "assign/export" "$file" "$no" "$value" "runtime:$rel" "Assigned in shell and exported to child processes."
+      else
+        add_var_record "$var" "Shell variable" "assign" "$file" "$no" "$value" "runtime:$rel" "Assigned in shell script."
+      fi
+      case "$var" in
+        JAVA_VERSION|JDK_VERSION)
+          add_software_record "Java" "java-version-shell-variable" "$value" "shell variable $var" "runtime:$rel" "$file" "$no" "$code" "Java version configured in shell script."
+          ;;
+        JAVA_HOME)
+          add_software_record "Java" "java-home-shell-variable" "" "shell variable JAVA_HOME" "runtime:$rel" "$file" "$no" "$value" "Java home path configured in shell script."
+          ;;
+        JBOSS_HOME|WILDFLY_HOME)
+          add_software_record "WildFly/JBoss" "application-server-home-shell-variable" "" "shell variable $var" "runtime:$rel" "$file" "$no" "$value" "WildFly/JBoss home path configured in shell script."
+          ;;
+      esac
       if [[ -z "$value" ]]; then
         add_finding "WARN" "runtime:$rel" "$file" "$no" "VAR010" "Variable '$var' is initialized empty."
       fi
@@ -1273,11 +2028,13 @@ scan_shell_file() {
     if [[ "$code" =~ $re_read ]]; then
       var="${BASH_REMATCH[3]}"
       assigned_line["$var"]="${assigned_line[$var]:-$no}"
+      add_var_record "$var" "Shell variable" "read" "$file" "$no" "(stdin/runtime input)" "runtime:$rel" "Value is read at container runtime."
     fi
 
     if [[ "$code" =~ $re_for ]]; then
       var="${BASH_REMATCH[2]}"
       assigned_line["$var"]="${assigned_line[$var]:-$no}"
+      add_var_record "$var" "Shell variable" "for-loop" "$file" "$no" "(iterator)" "runtime:$rel" "Loop variable assigned by for statement."
     fi
 
     literal_pairs=()
@@ -1291,6 +2048,7 @@ scan_shell_file() {
       if [[ -n "$cli_arg" ]]; then
         if cli_rel="$(resolve_cli_reference "$cli_arg" "$rel" "$no" "runtime:$rel")"; then
           add_cli_file "$cli_rel" "jboss-cli --file from $rel:$no"
+          add_relation "$rel" "$cli_rel" "jboss-cli --file line $no" "runtime:$rel" "$file" "$no"
         else
           add_finding "WARN" "runtime:$rel" "$file" "$no" "CLI002" "jboss-cli --file target '$cli_arg' could not be resolved to a build-context CLI file."
         fi
@@ -1319,13 +2077,29 @@ scan_shell_file() {
     while IFS= read -r use; do
       [[ -z "$use" ]] && continue
       var="${use%%|*}"
-      kind="${use#*|}"
+      rest="${use#*|}"
+      kind="${rest%%|*}"
+      detail=""
+      [[ "$rest" == *"|"* ]] && detail="${rest#*|}"
       used_count["$var"]=$(( ${used_count[$var]:-0} + 1 ))
       first_use["$var"]="${first_use[$var]:-$no}"
+      if [[ -n "${assigned_line[$var]:-}" ]]; then
+        category="Shell variable reference"
+      elif [[ -v DOCKER_ENV[$var] ]]; then
+        category="Dockerfile ENV runtime reference"
+      elif is_standard_env_var "$var"; then
+        category="Standard environment variable reference"
+      else
+        category="External/runtime environment variable reference"
+      fi
+      note="Variable reference in shell script."
+      [[ "$kind" == "default" ]] && note="Reference has inline default/assignment fallback."
+      [[ "$kind" == "required" ]] && note="Reference requires external/runtime value."
+      add_var_record "$var" "$category" "$kind" "$file" "$no" "$detail" "runtime:$rel" "$note"
       if [[ "$kind" == "required" ]]; then
         add_finding "WARN" "runtime:$rel" "$file" "$no" "VAR011" "Variable '$var' is required from outside or earlier initialization via \${$var:?...}."
       elif [[ "$kind" == "plain" || "$kind" == "alternate" ]]; then
-        if [[ -z "${assigned_line[$var]:-}" && -z "${DOCKER_ENV[$var]:-}" ]] && ! is_standard_env_var "$var"; then
+        if [[ -z "${assigned_line[$var]:-}" && ! -v DOCKER_ENV[$var] ]] && ! is_standard_env_var "$var"; then
           add_finding "WARN" "runtime:$rel" "$file" "$no" "VAR012" "Variable '$var' is used without local initialization, Dockerfile ENV, or a default; it likely must be supplied from outside."
         elif [[ -n "${assigned_line[$var]:-}" && "${assigned_line[$var]}" -gt "$no" ]]; then
           add_finding "WARN" "runtime:$rel" "$file" "$no" "VAR013" "Variable '$var' is used before its first initialization on line ${assigned_line[$var]}."
@@ -1369,6 +2143,282 @@ extract_cli_value() {
   sed -n "s/.*$key[[:space:]]*=[[:space:]]*['\"]\\{0,1\\}\\([^,'\")[:space:]]*\\).*/\\1/p" <<< "$text" | head -n 1
 }
 
+extract_cli_subsystem() {
+  local code="$1"
+  sed -n 's#.*\/subsystem=\([^/:,)]*\).*#\1#p' <<< "$code" | head -n 1
+}
+
+extract_cli_resource() {
+  local code="$1" path
+  path="${code%%:*}"
+  path="${path##*/}"
+  [[ "$path" == subsystem=* ]] && path=""
+  printf '%s' "$path"
+}
+
+extract_cli_operation() {
+  local code="$1" op
+  op="${code#*:}"
+  op="${op%%(*}"
+  op="${op%% *}"
+  printf '%s' "$op"
+}
+
+extract_cli_args_text() {
+  local code="$1"
+  if [[ "$code" == *"("* && "$code" == *")"* ]]; then
+    local args="${code#*(}"
+    args="${args%)*}"
+    printf '%s' "$args"
+  fi
+}
+
+split_cli_arg_pairs() {
+  awk '
+  {
+    depth=0; in_string=0; quote=""; token="";
+    for (i=1; i<=length($0); i++) {
+      c=substr($0,i,1);
+      if (in_string) {
+        token=token c;
+        if (c==quote) in_string=0;
+        continue;
+      }
+      if (c=="\"" || c=="\047") {
+        in_string=1; quote=c; token=token c; continue;
+      }
+      if (c=="(" || c=="[" || c=="{") depth++;
+      if (c==")" || c=="]" || c=="}") depth--;
+      if (c=="," && depth==0) {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", token);
+        if (token!="") print token;
+        token="";
+      } else {
+        token=token c;
+      }
+    }
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", token);
+    if (token!="") print token;
+  }'
+}
+
+clean_cli_value() {
+  local value="$1"
+  value="$(trim "$value")"
+  value="${value%\"}"
+  value="${value#\"}"
+  value="${value%\'}"
+  value="${value#\'}"
+  printf '%s' "$value"
+}
+
+jboss_setting_description() {
+  local subsystem="$1" key="$2"
+  case "$subsystem:$key" in
+    datasources:jndi-name) printf 'JNDI name that applications use to look up the datasource.' ;;
+    datasources:driver-name) printf 'Datasource driver name registered in the WildFly datasource subsystem.' ;;
+    datasources:driver-module-name) printf 'JBoss module name that provides the JDBC driver.' ;;
+    datasources:driver-class-name) printf 'JDBC driver implementation class.' ;;
+    datasources:driver-xa-datasource-class-name) printf 'XA datasource implementation class for XA transactions.' ;;
+    datasources:connection-url) printf 'JDBC connection URL used by the datasource.' ;;
+    datasources:user-name) printf 'Database username configured for the datasource.' ;;
+    datasources:password) printf 'Database password or expression used by the datasource.' ;;
+    datasources:min-pool-size) printf 'Minimum number of physical database connections kept in the pool.' ;;
+    datasources:max-pool-size) printf 'Maximum number of physical database connections allowed in the pool.' ;;
+    datasources:blocking-timeout-wait-millis) printf 'Maximum wait time for a connection from the pool before failing.' ;;
+    datasources:idle-timeout-minutes) printf 'How long idle connections can remain in the pool before being closed.' ;;
+    datasources:prepared-statements-cache-size) printf 'Number of prepared statements cached per connection.' ;;
+    datasources:validate-on-match) printf 'Whether to validate a connection every time it is checked out from the pool.' ;;
+    datasources:background-validation) printf 'Whether idle connections are validated in the background.' ;;
+    datasources:background-validation-millis) printf 'Interval for background connection validation.' ;;
+    datasources:check-valid-connection-sql) printf 'SQL statement used to validate database connections.' ;;
+    datasources:pool-prefill) printf 'Whether to create the minimum pool connections during startup.' ;;
+    datasources:statistics-enabled) printf 'Whether datasource runtime statistics are enabled.' ;;
+    datasources:enabled) printf 'Whether the datasource or JDBC driver is enabled.' ;;
+    undertow:proxy-address-forwarding) printf 'Whether Undertow trusts proxy forwarding headers for client address and scheme.' ;;
+    undertow:max-post-size) printf 'Maximum HTTP request body size accepted by Undertow.' ;;
+    undertow:buffer-cache) printf 'Undertow buffer cache reference used by handlers.' ;;
+    logging:level) printf 'Logging level for the selected logger or handler.' ;;
+    transactions:default-timeout) printf 'Default transaction timeout in seconds.' ;;
+    deployment-scanner:auto-deploy-zipped) printf 'Whether zipped deployments are auto-deployed by the deployment scanner.' ;;
+    deployment-scanner:auto-deploy-exploded) printf 'Whether exploded deployments are auto-deployed by the deployment scanner.' ;;
+    deployment-scanner:scan-enabled) printf 'Whether deployment scanning is enabled.' ;;
+    *) printf 'WildFly/JBoss CLI subsystem attribute.' ;;
+  esac
+}
+
+jboss_setting_recommendation() {
+  local subsystem="$1" key="$2" resource="$3"
+  case "$subsystem:$key" in
+    datasources:jndi-name) printf 'Use java:/jdbc/<name> or java:jboss/datasources/<name> consistently with application lookup names.' ;;
+    datasources:driver-name) printf 'Must match an installed JDBC driver name.' ;;
+    datasources:driver-module-name) printf 'Use the module that contains the JDBC driver, for example org.postgresql, com.oracle, com.mysql.' ;;
+    datasources:driver-class-name) printf 'Use the vendor driver class, for example org.postgresql.Driver, oracle.jdbc.OracleDriver, com.mysql.cj.jdbc.Driver.' ;;
+    datasources:connection-url) printf 'Externalize environment-specific host, port, database, and credentials; avoid hard-coded production secrets.' ;;
+    datasources:user-name|datasources:password) printf 'Use credential store, environment expression, or secret injection instead of plain literal secrets.' ;;
+    datasources:min-pool-size) printf '0-5 for typical containers; keep <= max-pool-size and size from load tests.' ;;
+    datasources:max-pool-size) printf '20-100 for many services, capped by database capacity and replica count.' ;;
+    datasources:blocking-timeout-wait-millis) printf '30000-60000 milliseconds.' ;;
+    datasources:idle-timeout-minutes) printf '5-15 minutes.' ;;
+    datasources:prepared-statements-cache-size) printf '32-100 when prepared statement caching is beneficial.' ;;
+    datasources:validate-on-match) printf 'false when background-validation=true; true can be acceptable for small pools needing strict checkout validation.' ;;
+    datasources:background-validation) printf 'true for production pools unless validate-on-match is intentionally used.' ;;
+    datasources:background-validation-millis) printf '30000-60000 milliseconds.' ;;
+    datasources:check-valid-connection-sql) printf 'Use a cheap vendor-specific validation query, for example SELECT 1.' ;;
+    datasources:pool-prefill) printf 'false unless startup must eagerly open min-pool-size connections.' ;;
+    datasources:statistics-enabled) printf 'false by default; enable when metrics are required and overhead is acceptable.' ;;
+    datasources:enabled) printf 'true for active datasources/drivers.' ;;
+    undertow:proxy-address-forwarding) printf 'true only when running behind a trusted reverse proxy that sets forwarding headers.' ;;
+    undertow:max-post-size) printf 'Set explicitly to the smallest value that supports expected uploads/request bodies.' ;;
+    logging:level) printf 'INFO for production by default; DEBUG/TRACE only temporarily.' ;;
+    transactions:default-timeout) printf '300-600 seconds unless application transaction requirements differ.' ;;
+    deployment-scanner:auto-deploy-zipped|deployment-scanner:auto-deploy-exploded|deployment-scanner:scan-enabled) printf 'false in immutable container images; deploy during build or startup script instead.' ;;
+    *) printf 'Review against the WildFly version documentation and workload requirements.' ;;
+  esac
+}
+
+jboss_setting_distance() {
+  local subsystem="$1" key="$2" value="$3"
+  local lval
+  lval="$(lower "$value")"
+  case "$subsystem:$key" in
+    datasources:jndi-name)
+      [[ "$value" == java:/* || "$value" == java:jboss/* ]] && printf 'matches naming convention' || printf 'does not match java:/ or java:jboss/ naming convention'
+      ;;
+    datasources:min-pool-size)
+      numeric_range_distance "$value" 0 5 ''
+      ;;
+    datasources:max-pool-size)
+      numeric_range_distance "$value" 20 100 ''
+      ;;
+    datasources:blocking-timeout-wait-millis)
+      numeric_range_distance "$value" 30000 60000 ' ms'
+      ;;
+    datasources:idle-timeout-minutes)
+      numeric_range_distance "$value" 5 15 ' min'
+      ;;
+    datasources:prepared-statements-cache-size)
+      numeric_range_distance "$value" 32 100 ''
+      ;;
+    datasources:background-validation)
+      bool_distance "$value" "true"
+      ;;
+    datasources:background-validation-millis)
+      numeric_range_distance "$value" 30000 60000 ' ms'
+      ;;
+    datasources:pool-prefill|datasources:statistics-enabled)
+      bool_distance "$value" "false"
+      ;;
+    datasources:enabled)
+      bool_distance "$value" "true"
+      ;;
+    logging:level)
+      case "$lval" in
+        info) printf 'matches recommended production default' ;;
+        warn|error) printf 'more restrictive than INFO; verify observability requirements' ;;
+        debug|trace|all) printf 'more verbose than recommended production default' ;;
+        *) printf 'context-dependent' ;;
+      esac
+      ;;
+    transactions:default-timeout)
+      numeric_range_distance "$value" 300 600 ' sec'
+      ;;
+    deployment-scanner:auto-deploy-zipped|deployment-scanner:auto-deploy-exploded|deployment-scanner:scan-enabled)
+      bool_distance "$value" "false"
+      ;;
+    *) printf 'N/A or context-dependent' ;;
+  esac
+}
+
+jboss_setting_severity() {
+  local subsystem="$1" key="$2" value="$3"
+  local lval
+  lval="$(lower "$value")"
+  case "$subsystem:$key" in
+    datasources:jndi-name)
+      [[ "$value" == java:/* || "$value" == java:jboss/* ]] && printf 'OK' || printf 'WARN'
+      ;;
+    datasources:min-pool-size)
+      numeric_range_severity "$value" 0 5
+      ;;
+    datasources:max-pool-size)
+      numeric_range_severity "$value" 20 100
+      ;;
+    datasources:blocking-timeout-wait-millis)
+      numeric_range_severity "$value" 30000 60000
+      ;;
+    datasources:idle-timeout-minutes)
+      numeric_range_severity "$value" 5 15
+      ;;
+    datasources:prepared-statements-cache-size)
+      numeric_range_severity "$value" 32 100
+      ;;
+    datasources:background-validation)
+      bool_severity "$value" "true"
+      ;;
+    datasources:background-validation-millis)
+      numeric_range_severity "$value" 30000 60000
+      ;;
+    datasources:pool-prefill|datasources:statistics-enabled)
+      bool_severity "$value" "false"
+      ;;
+    datasources:enabled)
+      bool_severity "$value" "true"
+      ;;
+    logging:level)
+      case "$lval" in
+        debug|trace|all) printf 'WARN' ;;
+        *) printf 'INFO' ;;
+      esac
+      ;;
+    transactions:default-timeout)
+      numeric_range_severity "$value" 300 600
+      ;;
+    deployment-scanner:auto-deploy-zipped|deployment-scanner:auto-deploy-exploded|deployment-scanner:scan-enabled)
+      bool_severity "$value" "false"
+      ;;
+    *) printf 'INFO' ;;
+  esac
+}
+
+record_jboss_cli_setting() {
+  local subsystem="$1" resource="$2" operation="$3" key="$4" value="$5" file="$6" line="$7" phase="$8" evidence="$9"
+  local component setting
+  [[ -z "$subsystem" || -z "$key" ]] && return 0
+  component="$subsystem"
+  [[ -n "$resource" ]] && component="$component/$resource"
+  setting="$subsystem.$key"
+  [[ -n "$resource" ]] && setting="$subsystem.$resource.$key"
+  add_config_record "WildFly/JBoss CLI" "$component" "$setting" "$(jboss_setting_description "$subsystem" "$key")" "$value" "$(jboss_setting_recommendation "$subsystem" "$key" "$resource")" "$(jboss_setting_distance "$subsystem" "$key" "$value")" "$(jboss_setting_severity "$subsystem" "$key" "$value")" "$phase" "$file" "$line" "$evidence"
+}
+
+scan_jboss_cli_settings() {
+  local code="$1" file="$2" line="$3" phase="$4"
+  local subsystem resource operation args pair key value write_name write_value
+  subsystem="$(extract_cli_subsystem "$code")"
+  [[ -z "$subsystem" ]] && return 0
+  resource="$(extract_cli_resource "$code")"
+  operation="$(extract_cli_operation "$code")"
+  args="$(extract_cli_args_text "$code")"
+  [[ -z "$args" ]] && return 0
+
+  while IFS= read -r pair; do
+    key="$(trim "${pair%%=*}")"
+    value="$(clean_cli_value "${pair#*=}")"
+    [[ -z "$key" || "$pair" != *=* ]] && continue
+    if [[ "$operation" == "write-attribute" ]]; then
+      [[ "$key" == "name" ]] && write_name="$value"
+      [[ "$key" == "value" ]] && write_value="$value"
+    else
+      record_jboss_cli_setting "$subsystem" "$resource" "$operation" "$key" "$value" "$file" "$line" "$phase" "$code"
+    fi
+  done < <(printf '%s\n' "$args" | split_cli_arg_pairs)
+
+  if [[ "$operation" == "write-attribute" && -n "$write_name" ]]; then
+    record_jboss_cli_setting "$subsystem" "$resource" "$operation" "$write_name" "$write_value" "$file" "$line" "$phase" "$code"
+  fi
+}
+
 check_jndi_value() {
   local value="$1" file="$2" line="$3" phase="$4" source="$5"
   [[ -z "$value" ]] && return 0
@@ -1389,11 +2439,13 @@ check_jndi_value() {
 check_cli_line() {
   local line_text="$1" file="$2" line="$3" phase="$4" cli_name="$5"
   local code jndi binding_type dquotes lpar rpar lbrace rbrace lbrack rbrack
+  local driver_name driver_module driver_class xa_class driver_vendor driver_version driver_label
   local re_type_param='(^|[,(]|[[:space:]])type[[:space:]]*='
   local re_value_param='(^|[,(]|[[:space:]])value[[:space:]]*='
   local re_lookup_param='(^|[,(]|[[:space:]])lookup[[:space:]]*='
   code="$(trim "${line_text%%#*}")"
   [[ -z "$code" ]] && return 0
+  scan_jboss_cli_settings "$code" "$file" "$line" "$phase"
 
   dquotes=$(awk '{
     n=0; esc=0;
@@ -1427,6 +2479,18 @@ check_cli_line() {
   if [[ "$code" == *"jndi-name"* ]]; then
     jndi="$(extract_cli_value "jndi-name" "$code")"
     check_jndi_value "$jndi" "$file" "$line" "$phase" "jboss-cli"
+  fi
+
+  driver_name="$(extract_cli_value "driver-name" "$code")"
+  driver_module="$(extract_cli_value "driver-module-name" "$code")"
+  driver_class="$(extract_cli_value "driver-class-name" "$code")"
+  xa_class="$(extract_cli_value "driver-xa-datasource-class-name" "$code")"
+  if [[ -n "$driver_name" || -n "$driver_module" || -n "$driver_class" || -n "$xa_class" ]]; then
+    driver_label="${driver_name:-${driver_module:-${driver_class:-$xa_class}}}"
+    driver_vendor="$(infer_db_driver_vendor "$driver_label $driver_module $driver_class $xa_class")"
+    [[ -z "$driver_vendor" ]] && driver_vendor="$driver_label"
+    driver_version="$(infer_version_from_filename "$driver_label")"
+    add_software_record "$driver_vendor" "database-driver-cli-config" "$driver_version" "WildFly jboss-cli datasource/driver config" "$phase" "$file" "$line" "$code" "driver-name=$driver_name; driver-module-name=$driver_module; driver-class-name=$driver_class; driver-xa-datasource-class-name=$xa_class"
   fi
 
   if [[ "$code" == *"/subsystem=naming/binding="* || "$code" == *"binding="*":add("* ]]; then
@@ -1606,6 +2670,21 @@ write_csv_row() {
   printf '\n' >> "$REPORT_FILE"
 }
 
+write_csv_row_to_file() {
+  local output="$1"
+  shift
+  local field first=1
+  for field in "$@"; do
+    if (( first )); then
+      first=0
+    else
+      printf ',' >> "$output"
+    fi
+    csv_escape "$field" >> "$output"
+  done
+  printf '\n' >> "$output"
+}
+
 count_codes_by_sev() {
   local sev="$1"
   shift
@@ -1682,6 +2761,151 @@ write_report_file() {
   done
 }
 
+mermaid_escape() {
+  local s="$1"
+  s="${s//$'\r'/ }"
+  s="${s//$'\n'/ }"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+write_mermaid_file() {
+  (( MERMAID_ENABLED )) || return 0
+  local dir i label id from to from_id to_id edge_label node_count=1
+  declare -A node_ids=()
+  declare -A node_labels=()
+
+  dir="$(dirname -- "$MERMAID_FILE")"
+  mkdir -p -- "$dir"
+  progress_log "OUTPUT" "Writing Mermaid relationship diagram: $MERMAID_FILE"
+
+  for ((i=0; i<${#REL_FROM[@]}; i++)); do
+    for label in "${REL_FROM[$i]}" "${REL_TO[$i]}"; do
+      if [[ -z "${node_ids[$label]:-}" ]]; then
+        id="N$node_count"
+        node_ids["$label"]="$id"
+        node_labels["$id"]="$label"
+        node_count=$((node_count + 1))
+      fi
+    done
+  done
+
+  {
+    printf 'flowchart LR\n'
+    printf '  classDef dockerfile fill:#d9e8ff,stroke:#3465a4,color:#111827;\n'
+    printf '  classDef shell fill:#e8f7df,stroke:#4f8a10,color:#111827;\n'
+    printf '  classDef cli fill:#fff4d6,stroke:#b7791f,color:#111827;\n'
+    printf '  classDef resource fill:#f3f4f6,stroke:#6b7280,color:#111827;\n'
+    if (( ${#REL_FROM[@]} == 0 )); then
+      printf '  N1["Dockerfile"]\n'
+      printf '  N2["No build-context file relation was detected"]\n'
+      printf '  N1 --> N2\n'
+    else
+      for ((i=1; i<node_count; i++)); do
+        id="N$i"
+        label="${node_labels[$id]}"
+        printf '  %s["%s"]\n' "$id" "$(mermaid_escape "$label")"
+      done
+      for ((i=0; i<${#REL_FROM[@]}; i++)); do
+        from="${REL_FROM[$i]}"
+        to="${REL_TO[$i]}"
+        from_id="${node_ids[$from]}"
+        to_id="${node_ids[$to]}"
+        edge_label="${REL_LABEL[$i]}"
+        printf '  %s -- "%s" --> %s\n' "$from_id" "$(mermaid_escape "$edge_label")" "$to_id"
+      done
+    fi
+    for ((i=1; i<node_count; i++)); do
+      id="N$i"
+      label="${node_labels[$id]}"
+      case "$(lower "$label")" in
+        dockerfile) printf '  class %s dockerfile\n' "$id" ;;
+        *.sh|*.bash|*.ksh) printf '  class %s shell\n' "$id" ;;
+        *.cli) printf '  class %s cli\n' "$id" ;;
+        *) printf '  class %s resource\n' "$id" ;;
+      esac
+    done
+  } > "$MERMAID_FILE"
+}
+
+write_variable_report_file() {
+  (( VAR_REPORT_ENABLED )) || return 0
+  local dir i file value note category action
+  dir="$(dirname -- "$VAR_REPORT_FILE")"
+  mkdir -p -- "$dir"
+  progress_log "OUTPUT" "Writing Excel variable inventory CSV: $VAR_REPORT_FILE"
+  printf '\xEF\xBB\xBF' > "$VAR_REPORT_FILE"
+  write_csv_row_to_file "$VAR_REPORT_FILE" \
+    "No" "VariableName" "Category" "Action" "Phase" "File" "Line" "ConfiguredValue" "Note"
+
+  if (( ${#VAR_NAME[@]} == 0 )); then
+    write_csv_row_to_file "$VAR_REPORT_FILE" \
+      "1" "-" "No variables detected" "-" "-" "-" "-" "-" "Dockerfile/shell variable references were not detected."
+    return 0
+  fi
+
+  for ((i=0; i<${#VAR_NAME[@]}; i++)); do
+    file="$(display_path "${VAR_FILE[$i]}")"
+    value="${VAR_VALUE[$i]}"
+    [[ -z "$value" ]] && value="(empty/not configured in this occurrence)"
+    category="${VAR_CATEGORY[$i]}"
+    action="${VAR_ACTION[$i]}"
+    note="${VAR_NOTE[$i]}"
+    write_csv_row_to_file "$VAR_REPORT_FILE" \
+      "$((i + 1))" "${VAR_NAME[$i]}" "$category" "$action" "${VAR_PHASE[$i]}" "$file" "${VAR_LINE[$i]}" "$value" "$note"
+  done
+}
+
+write_software_report_file() {
+  (( SOFTWARE_REPORT_ENABLED )) || return 0
+  local dir i file version note
+  dir="$(dirname -- "$SOFTWARE_REPORT_FILE")"
+  mkdir -p -- "$dir"
+  progress_log "OUTPUT" "Writing Excel software inventory CSV: $SOFTWARE_REPORT_FILE"
+  printf '\xEF\xBB\xBF' > "$SOFTWARE_REPORT_FILE"
+  write_csv_row_to_file "$SOFTWARE_REPORT_FILE" \
+    "No" "SoftwareName" "Type" "Version" "SourceOrInstallMethod" "Phase" "File" "Line" "Evidence" "Note"
+
+  if (( ${#SW_NAME[@]} == 0 )); then
+    write_csv_row_to_file "$SOFTWARE_REPORT_FILE" \
+      "1" "-" "No software detected" "-" "-" "-" "-" "-" "-" "No base image, install command, Java, application server, or database driver information was detected."
+    return 0
+  fi
+
+  for ((i=0; i<${#SW_NAME[@]}; i++)); do
+    file="$(display_path "${SW_FILE[$i]}")"
+    version="${SW_VERSION[$i]}"
+    [[ -z "$version" ]] && version="(unknown)"
+    note="${SW_NOTE[$i]}"
+    write_csv_row_to_file "$SOFTWARE_REPORT_FILE" \
+      "$((i + 1))" "${SW_NAME[$i]}" "${SW_TYPE[$i]}" "$version" "${SW_SOURCE[$i]}" "${SW_PHASE[$i]}" "$file" "${SW_LINE[$i]}" "${SW_EVIDENCE[$i]}" "$note"
+  done
+}
+
+write_config_report_file() {
+  (( CONFIG_REPORT_ENABLED )) || return 0
+  local dir i file
+  dir="$(dirname -- "$CONFIG_REPORT_FILE")"
+  mkdir -p -- "$dir"
+  progress_log "OUTPUT" "Writing Excel Java/JBoss setting audit CSV: $CONFIG_REPORT_FILE"
+  printf '\xEF\xBB\xBF' > "$CONFIG_REPORT_FILE"
+  write_csv_row_to_file "$CONFIG_REPORT_FILE" \
+    "No" "Domain" "Component" "SettingItem" "Description" "ConfiguredValue" "RecommendedSetting" "DistanceFromRecommendation" "Assessment" "Phase" "File" "Line" "Evidence"
+
+  if (( ${#CFG_SETTING[@]} == 0 )); then
+    write_csv_row_to_file "$CONFIG_REPORT_FILE" \
+      "1" "-" "-" "No Java/JBoss settings detected" "-" "-" "-" "-" "INFO" "-" "-" "-" "No Java parameters or WildFly/JBoss CLI subsystem settings were detected."
+    return 0
+  fi
+
+  for ((i=0; i<${#CFG_SETTING[@]}; i++)); do
+    file="$(display_path "${CFG_FILE[$i]}")"
+    write_csv_row_to_file "$CONFIG_REPORT_FILE" \
+      "$((i + 1))" "${CFG_DOMAIN[$i]}" "${CFG_COMPONENT[$i]}" "${CFG_SETTING[$i]}" "${CFG_DESCRIPTION[$i]}" "${CFG_VALUE[$i]}" "${CFG_RECOMMENDED[$i]}" "${CFG_DISTANCE[$i]}" "${CFG_SEVERITY[$i]}" "${CFG_PHASE[$i]}" "$file" "${CFG_LINE[$i]}" "${CFG_EVIDENCE[$i]}"
+  done
+}
+
 print_header() {
   local stages stage_label
   stages=$((FINAL_STAGE + 1))
@@ -1705,6 +2929,18 @@ print_header() {
   printf 'Summary    : ERROR=%s WARN=%s INFO=%s\n' "${F_COUNT[ERROR]:-0}" "${F_COUNT[WARN]:-0}" "${F_COUNT[INFO]:-0}"
   if (( REPORT_ENABLED )); then
     printf 'CSV report : %s\n' "$REPORT_FILE"
+  fi
+  if (( MERMAID_ENABLED )); then
+    printf 'Mermaid    : %s\n' "$MERMAID_FILE"
+  fi
+  if (( VAR_REPORT_ENABLED )); then
+    printf 'Variables  : %s\n' "$VAR_REPORT_FILE"
+  fi
+  if (( SOFTWARE_REPORT_ENABLED )); then
+    printf 'Software   : %s\n' "$SOFTWARE_REPORT_FILE"
+  fi
+  if (( CONFIG_REPORT_ENABLED )); then
+    printf 'Config     : %s\n' "$CONFIG_REPORT_FILE"
   fi
   printf '\n'
 }
@@ -1749,6 +2985,22 @@ main() {
     [[ -z "$REPORT_FILE" ]] && REPORT_FILE="$PWD/docker-context-checker-results.csv"
     REPORT_FILE="$(abs_path "$REPORT_FILE")"
   fi
+  if (( MERMAID_ENABLED )); then
+    [[ -z "$MERMAID_FILE" ]] && MERMAID_FILE="$PWD/docker-context-relations.mmd"
+    MERMAID_FILE="$(abs_path "$MERMAID_FILE")"
+  fi
+  if (( VAR_REPORT_ENABLED )); then
+    [[ -z "$VAR_REPORT_FILE" ]] && VAR_REPORT_FILE="$PWD/docker-context-checker-variables.csv"
+    VAR_REPORT_FILE="$(abs_path "$VAR_REPORT_FILE")"
+  fi
+  if (( SOFTWARE_REPORT_ENABLED )); then
+    [[ -z "$SOFTWARE_REPORT_FILE" ]] && SOFTWARE_REPORT_FILE="$PWD/docker-context-checker-software.csv"
+    SOFTWARE_REPORT_FILE="$(abs_path "$SOFTWARE_REPORT_FILE")"
+  fi
+  if (( CONFIG_REPORT_ENABLED )); then
+    [[ -z "$CONFIG_REPORT_FILE" ]] && CONFIG_REPORT_FILE="$PWD/docker-context-checker-config.csv"
+    CONFIG_REPORT_FILE="$(abs_path "$CONFIG_REPORT_FILE")"
+  fi
 
   progress_log "START" "Context=$CONTEXT_DIR Dockerfile=$DOCKERFILE_PATH"
   progress_log "CHECK" "Loading .dockerignore patterns"
@@ -1766,6 +3018,10 @@ main() {
   fi
   progress_log "DONE" "Static checks completed"
   write_report_file
+  write_mermaid_file
+  write_variable_report_file
+  write_software_report_file
+  write_config_report_file
   print_report
 
   case "$FAIL_ON" in
