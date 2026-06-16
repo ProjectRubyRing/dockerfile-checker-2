@@ -30,6 +30,16 @@ RUNTIME_PROBE_IMAGE=""
 RUNTIME_PROBE_KEEP_IMAGE=0
 RUNTIME_PROBE_IMAGE_CUSTOM=0
 declare -a RUNTIME_PROBE_BUILD_OPTIONS=()
+EAP_STARTUP_PROBE_ENABLED=0
+EAP_STARTUP_IMAGE=""
+EAP_STARTUP_IMAGE_CUSTOM=0
+EAP_STARTUP_KEEP_IMAGE=0
+EAP_STARTUP_CONTAINER=""
+EAP_STARTUP_CONTAINER_CUSTOM=0
+EAP_STARTUP_KEEP_CONTAINER=0
+EAP_STARTUP_TIMEOUT=180
+declare -a EAP_STARTUP_BUILD_OPTIONS=()
+declare -a EAP_STARTUP_RUN_OPTIONS=()
 
 declare -a F_SEV=()
 declare -a F_PHASE=()
@@ -179,6 +189,24 @@ Options:
                            Repeat for secrets, build args, network options, etc.
       --runtime-probe-keep-image
                            Keep the temporary probe image after checks.
+      --eap-startup-probe  Build and start the container, then inspect JBoss EAP
+                           startup logs for server/deployment success.
+      --eap-startup-timeout SEC
+                           Seconds to wait for JBoss EAP startup logs. Default: 180.
+      --eap-startup-image TAG
+                           Image tag to use for --eap-startup-probe.
+      --eap-startup-container NAME
+                           Container name to use for --eap-startup-probe.
+      --eap-startup-build-option ARG
+                           Extra docker build option for --eap-startup-probe.
+                           Repeat for secrets, build args, network options, etc.
+      --eap-startup-run-option ARG
+                           Extra docker run option for --eap-startup-probe.
+                           Repeat for env, port, network, volume options, etc.
+      --eap-startup-keep-image
+                           Keep the temporary EAP probe image after checks.
+      --eap-startup-keep-container
+                           Keep the EAP probe container after checks.
       --include-unused-all Report every unreferenced file in the build context.
       --fail-on LEVEL      error, warn, or never. Default: error.
       --no-progress        Do not print phase-by-phase progress messages.
@@ -190,6 +218,8 @@ Options:
       --no-config-output   Do not write the Java/JBoss setting audit CSV.
       --no-ecs-env-output  Do not write the ECS environment inventory CSV.
       --no-runtime-probe   Disable Docker runtime probes.
+      --no-eap-startup-probe
+                           Disable JBoss EAP startup probe.
       --no-color           Disable ANSI colors.
   -h, --help               Show this help.
       --version            Show version.
@@ -205,6 +235,7 @@ Checks include:
   - ECS task definition environment/secrets candidates detected from Dockerfile,
     entrypoint shells, and WildFly/JBoss CLI expressions.
   - Optional Docker runtime probe for ksh and java executability.
+  - Optional JBoss EAP 8.1 startup log probe and deployed WAR detection.
   - WildFly jboss-cli --file / --commands detection, CLI file syntax heuristics,
     and JNDI setting validation.
   - UBI 9.6 final image consistency, especially runtime entrypoint behavior.
@@ -1022,6 +1053,53 @@ parse_args() {
         RUNTIME_PROBE_ENABLED=1
         shift
         ;;
+      --eap-startup-probe)
+        EAP_STARTUP_PROBE_ENABLED=1
+        shift
+        ;;
+      --eap-startup-timeout)
+        [[ $# -ge 2 ]] || die "$1 requires seconds"
+        [[ "$2" =~ ^[0-9]+$ ]] || die "$1 requires a positive integer"
+        EAP_STARTUP_TIMEOUT="$2"
+        EAP_STARTUP_PROBE_ENABLED=1
+        shift 2
+        ;;
+      --eap-startup-image)
+        [[ $# -ge 2 ]] || die "$1 requires an image tag"
+        EAP_STARTUP_IMAGE="$2"
+        EAP_STARTUP_IMAGE_CUSTOM=1
+        EAP_STARTUP_PROBE_ENABLED=1
+        shift 2
+        ;;
+      --eap-startup-container)
+        [[ $# -ge 2 ]] || die "$1 requires a container name"
+        EAP_STARTUP_CONTAINER="$2"
+        EAP_STARTUP_CONTAINER_CUSTOM=1
+        EAP_STARTUP_PROBE_ENABLED=1
+        shift 2
+        ;;
+      --eap-startup-build-option)
+        [[ $# -ge 2 ]] || die "$1 requires a docker build option"
+        EAP_STARTUP_BUILD_OPTIONS+=("$2")
+        EAP_STARTUP_PROBE_ENABLED=1
+        shift 2
+        ;;
+      --eap-startup-run-option)
+        [[ $# -ge 2 ]] || die "$1 requires a docker run option"
+        EAP_STARTUP_RUN_OPTIONS+=("$2")
+        EAP_STARTUP_PROBE_ENABLED=1
+        shift 2
+        ;;
+      --eap-startup-keep-image)
+        EAP_STARTUP_KEEP_IMAGE=1
+        EAP_STARTUP_PROBE_ENABLED=1
+        shift
+        ;;
+      --eap-startup-keep-container)
+        EAP_STARTUP_KEEP_CONTAINER=1
+        EAP_STARTUP_PROBE_ENABLED=1
+        shift
+        ;;
       --include-unused-all)
         INCLUDE_UNUSED_ALL=1
         shift
@@ -1065,6 +1143,10 @@ parse_args() {
         ;;
       --no-runtime-probe)
         RUNTIME_PROBE_ENABLED=0
+        shift
+        ;;
+      --no-eap-startup-probe)
+        EAP_STARTUP_PROBE_ENABLED=0
         shift
         ;;
       --version)
@@ -3026,6 +3108,161 @@ run_runtime_probe() {
   fi
 }
 
+extract_eap_deployed_wars() {
+  awk '
+  {
+    line=$0
+    while (match(line, /[A-Za-z0-9_.+@%:=\/-]+\.war/)) {
+      war=substr(line, RSTART, RLENGTH)
+      gsub(/^deployment\./, "", war)
+      if (!seen[war]++) print war
+      line=substr(line, RSTART + RLENGTH)
+    }
+  }'
+}
+
+extract_eap_matching_lines() {
+  local pattern="$1"
+  grep -Ei "$pattern" | head -n 8 | sed 's/^[[:space:]]*//'
+}
+
+eap_log_has_startup_success() {
+  grep -Eqi 'WFLYSRV0025:.*(JBoss EAP|WildFly|started in|Started [0-9]+ of [0-9]+ services)|JBoss EAP .*started in|WildFly .*started in|Started [0-9]+ of [0-9]+ services'
+}
+
+eap_log_has_deploy_success() {
+  grep -Eqi 'WFLYSRV0010: Deployed ".*\.war"|Deployed ".*\.war"|Deployment ".*\.war" successfully|Successfully deployed .*\.war'
+}
+
+eap_log_has_failure() {
+  grep -Eqi 'WFLYSRV0026|WFLYSRV0153|WFLYCTL0180|WFLYCTL0080|WFLYSRV0087|failed to .*deploy|Deployment .*failed|ERROR .*\.war|Caused by:|Exception'
+}
+
+eap_log_has_eap81() {
+  grep -Eqi 'JBoss EAP[^0-9]*8\.1|EAP[^0-9]*8\.1'
+}
+
+run_eap_startup_probe() {
+  (( EAP_STARTUP_PROBE_ENABLED )) || return 0
+  local image container build_output info_output run_output logs cleanup_output auto_image=0 auto_container=0
+  local start deadline now startup_success=0 deploy_success=0 failure_seen=0 eap81_seen=0 exited=0 exit_status=""
+  local wars war_list startup_lines deploy_lines failure_lines
+
+  if [[ -z "$EAP_STARTUP_IMAGE" ]]; then
+    EAP_STARTUP_IMAGE="docker-context-checker-eap-probe:$(date '+%Y%m%d%H%M%S')-$$"
+    auto_image=1
+  fi
+  if [[ -z "$EAP_STARTUP_CONTAINER" ]]; then
+    EAP_STARTUP_CONTAINER="docker-context-checker-eap-probe-$(date '+%Y%m%d%H%M%S')-$$"
+    auto_container=1
+  fi
+  image="$EAP_STARTUP_IMAGE"
+  container="$EAP_STARTUP_CONTAINER"
+
+  progress_log "EAP-PROBE" "Checking Docker CLI and daemon"
+  if ! command -v docker >/dev/null 2>&1; then
+    add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP001" "JBoss EAP startup probe was requested, but docker command was not found in PATH."
+    return 0
+  fi
+  if ! info_output="$(docker info 2>&1)"; then
+    add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP001" "JBoss EAP startup probe was requested, but Docker daemon is not available. Output: $(compact_output "$info_output")"
+    return 0
+  fi
+
+  progress_log "EAP-PROBE" "Building Docker image for JBoss EAP startup probe: $image"
+  build_output="$(docker build "${EAP_STARTUP_BUILD_OPTIONS[@]}" -f "$DOCKERFILE_PATH" -t "$image" "$CONTEXT_DIR" 2>&1)"
+  if (($? != 0)); then
+    add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP002" "JBoss EAP startup probe image build failed. Output: $(compact_output "$build_output")"
+    return 0
+  fi
+
+  progress_log "EAP-PROBE" "Starting container for JBoss EAP log probe: $container"
+  run_output="$(docker run -d --name "$container" "${EAP_STARTUP_RUN_OPTIONS[@]}" "$image" 2>&1)"
+  if (($? != 0)); then
+    add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP003" "JBoss EAP startup probe container could not be started. Output: $(compact_output "$run_output")"
+    return 0
+  fi
+
+  start=$(date +%s)
+  deadline=$((start + EAP_STARTUP_TIMEOUT))
+  logs=""
+  while :; do
+    logs="$(docker logs "$container" 2>&1 || true)"
+    if printf '%s\n' "$logs" | eap_log_has_startup_success; then
+      startup_success=1
+    fi
+    if printf '%s\n' "$logs" | eap_log_has_deploy_success; then
+      deploy_success=1
+    fi
+    if printf '%s\n' "$logs" | eap_log_has_failure; then
+      failure_seen=1
+    fi
+    if printf '%s\n' "$logs" | eap_log_has_eap81; then
+      eap81_seen=1
+    fi
+    if (( startup_success && deploy_success )); then
+      break
+    fi
+    exit_status="$(docker inspect -f '{{.State.Status}}:{{.State.ExitCode}}' "$container" 2>/dev/null || true)"
+    if [[ "$exit_status" == exited:* || "$exit_status" == dead:* ]]; then
+      exited=1
+      break
+    fi
+    now=$(date +%s)
+    (( now >= deadline )) && break
+    sleep 2
+  done
+
+  war_list="$(printf '%s\n' "$logs" | extract_eap_deployed_wars | paste -sd ',' - | sed 's/,/, /g')"
+  startup_lines="$(printf '%s\n' "$logs" | extract_eap_matching_lines 'WFLYSRV0025:.*(started|JBoss EAP|WildFly)|Started [0-9]+ of [0-9]+ services')"
+  deploy_lines="$(printf '%s\n' "$logs" | extract_eap_matching_lines 'WFLYSRV0010: Deployed ".*\.war"|Deployed ".*\.war"|Deployment ".*\.war" successfully|Successfully deployed .*\.war')"
+  failure_lines="$(printf '%s\n' "$logs" | extract_eap_matching_lines 'WFLYSRV0026|WFLYSRV0153|WFLYCTL0180|WFLYCTL0080|WFLYSRV0087|failed to .*deploy|Deployment .*failed|ERROR .*\.war|Caused by:|Exception')"
+
+  if [[ -n "$war_list" ]]; then
+    add_finding "INFO" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP010" "Detected deployed WAR file(s) from JBoss EAP startup logs: $war_list"
+    while IFS= read -r wars; do
+      [[ -z "$wars" ]] && continue
+      add_software_record "$wars" "jboss-eap-deployed-war" "" "docker startup log probe" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "$wars" "WAR deployment detected from JBoss EAP startup logs."
+    done < <(printf '%s\n' "$logs" | extract_eap_deployed_wars)
+  fi
+
+  if (( startup_success && deploy_success )); then
+    add_finding "INFO" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP004" "JBoss EAP startup probe succeeded: startup success and WAR deployment success logs were found. WARs: ${war_list:-'(none parsed)'}. Startup log: $(compact_output "$startup_lines") Deployment log: $(compact_output "$deploy_lines")"
+    if (( ! eap81_seen )); then
+      add_finding "WARN" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP012" "JBoss EAP startup succeeded, but the logs did not clearly identify JBoss EAP 8.1. Verify the image version. Startup log: $(compact_output "$startup_lines")"
+    fi
+    if (( failure_seen )); then
+      add_finding "WARN" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP007" "Failure-looking lines were also found in JBoss EAP startup logs. Review whether they are harmless. Lines: $(compact_output "$failure_lines")"
+    fi
+  else
+    if (( failure_seen )); then
+      add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP007" "Failure-looking lines were found in JBoss EAP startup logs. Lines: $(compact_output "$failure_lines")"
+    fi
+    if (( startup_success && ! deploy_success )); then
+      add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP005" "JBoss EAP startup success log was found, but WAR deployment success log was not found before timeout. Startup log: $(compact_output "$startup_lines")"
+    elif (( deploy_success && ! startup_success )); then
+      add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP006" "WAR deployment success log was found, but JBoss EAP startup success log was not found before timeout. Deployment log: $(compact_output "$deploy_lines")"
+    elif (( exited )); then
+      add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP009" "JBoss EAP startup probe container exited before startup/deployment success was confirmed. Container state: $exit_status Log tail: $(compact_output "$(printf '%s\n' "$logs" | tail -n 30)")"
+    else
+      add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP008" "Timed out after ${EAP_STARTUP_TIMEOUT}s waiting for both JBoss EAP startup success and WAR deployment success logs. Log tail: $(compact_output "$(printf '%s\n' "$logs" | tail -n 30)")"
+    fi
+  fi
+
+  if (( ! EAP_STARTUP_KEEP_CONTAINER && auto_container && ! EAP_STARTUP_CONTAINER_CUSTOM )); then
+    progress_log "EAP-PROBE" "Removing JBoss EAP startup probe container: $container"
+    if ! cleanup_output="$(docker rm -f "$container" 2>&1)"; then
+      add_finding "INFO" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP011" "Temporary JBoss EAP probe container could not be removed automatically. Output: $(compact_output "$cleanup_output")"
+    fi
+  fi
+  if (( ! EAP_STARTUP_KEEP_IMAGE && auto_image && ! EAP_STARTUP_IMAGE_CUSTOM )); then
+    progress_log "EAP-PROBE" "Removing JBoss EAP startup probe image: $image"
+    if ! cleanup_output="$(docker image rm "$image" 2>&1)"; then
+      add_finding "INFO" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP011" "Temporary JBoss EAP probe image could not be removed automatically. Output: $(compact_output "$cleanup_output")"
+    fi
+  fi
+}
+
 report_unused_context_files() {
   local full rel
   progress_log "CHECK" "Scanning unreferenced build-context files"
@@ -3049,6 +3286,7 @@ check_item_for_code() {
     SEC*) printf 'Dockerfile BuildKit build secrets' ;;
     KSH*) printf 'ksh setup consistency' ;;
     RTP*) printf 'Docker runtime executable probe' ;;
+    EAP*) printf 'JBoss EAP startup probe' ;;
     UBI*) printf 'UBI 9.6 runtime consistency' ;;
     CLI*) printf 'WildFly jboss-cli syntax' ;;
     JNDI*) printf 'WildFly JNDI configuration' ;;
@@ -3111,6 +3349,18 @@ suggestion_for_code() {
     RTP004) printf 'Install ksh in the final image, verify PATH and /bin/sh availability, then rerun --runtime-probe.' ;;
     RTP006) printf 'Install a Java runtime/JDK in the final image, verify PATH/JAVA_HOME, then rerun --runtime-probe.' ;;
     RTP007) printf 'Remove the temporary probe image manually with docker image rm if it is no longer needed.' ;;
+    EAP001) printf 'Install Docker CLI and ensure the Docker daemon is running before using --eap-startup-probe.' ;;
+    EAP002) printf 'Fix the Docker build failure first. If the Dockerfile needs secrets or build args, pass them with repeated --eap-startup-build-option arguments.' ;;
+    EAP003) printf 'Fix container startup options, required environment variables, volumes, ports, or entrypoint permissions, then rerun --eap-startup-probe.' ;;
+    EAP004) printf 'JBoss EAP startup and WAR deployment success logs were found. Keep the listed WAR names and log lines as startup evidence.' ;;
+    EAP005) printf 'Confirm the WAR is copied to the EAP deployments directory, deployment scanner is enabled, and the expected WFLYSRV0010 deployment success log appears.' ;;
+    EAP006) printf 'Confirm server boot completes and the WFLYSRV0025 startup success log appears before timeout; increase --eap-startup-timeout if startup is slow.' ;;
+    EAP007) printf 'Review the failure lines in the startup log and fix deployment, datasource, module, or configuration errors before accepting the image.' ;;
+    EAP008) printf 'Increase --eap-startup-timeout only after confirming the server is still progressing; otherwise fix startup blockers shown in the log tail.' ;;
+    EAP009) printf 'Inspect the container log tail and exit code. The server process likely terminated before successful boot/deployment.' ;;
+    EAP010) printf 'Detected WAR file names are informational; verify they match the application artifacts intended for this image.' ;;
+    EAP011) printf 'Remove the temporary probe image or container manually with docker rm/docker image rm if it is no longer needed.' ;;
+    EAP012) printf 'Verify the runtime image really contains JBoss EAP 8.1; the startup log did not clearly prove that version.' ;;
     UBI001|UBI002) printf 'RHEL/UBI 9.6前提ならベースイメージタグを9.6に固定してください。' ;;
     UBI003|UBI004) printf 'UBI minimalではmicrodnf利用とキャッシュ削除を確認してください。パッケージ導入はDockerfileビルド時に寄せるのが基本です。' ;;
     UBI005|UBI012) printf 'subscription-managerに依存しない構成へ見直してください。UBIコンテナはホスト購読状態へ依存させない方が移植性があります。' ;;
@@ -3229,6 +3479,7 @@ write_report_file() {
   write_summary_csv_row serial "Dockerfile BuildKit build secrets" "SEC"
   write_summary_csv_row serial "ksh setup consistency" "KSH"
   write_summary_csv_row serial "Docker runtime executable probe" "RTP"
+  write_summary_csv_row serial "JBoss EAP startup probe" "EAP"
   write_summary_csv_row serial "WildFly jboss-cli構文" "CLI"
   write_summary_csv_row serial "WildFly JNDI設定" "JNDI"
   write_summary_csv_row serial "UBI 9.6 runtime整合性" "UBI"
@@ -3461,6 +3712,9 @@ print_header() {
   if (( RUNTIME_PROBE_ENABLED )); then
     printf 'Docker run : runtime probe enabled, image=%s\n' "${RUNTIME_PROBE_IMAGE:-auto}"
   fi
+  if (( EAP_STARTUP_PROBE_ENABLED )); then
+    printf 'EAP probe  : enabled, image=%s, timeout=%ss\n' "${EAP_STARTUP_IMAGE:-auto}" "$EAP_STARTUP_TIMEOUT"
+  fi
   printf '\n'
 }
 
@@ -3540,6 +3794,9 @@ main() {
     report_unused_context_files
     if (( RUNTIME_PROBE_ENABLED )); then
       run_runtime_probe
+    fi
+    if (( EAP_STARTUP_PROBE_ENABLED )); then
+      run_eap_startup_probe
     fi
   fi
   progress_log "DONE" "Checks completed"

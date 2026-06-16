@@ -102,12 +102,20 @@ Dockerを実際に起動して、ビルド後イメージ内で `ksh` と `java 
 ./docker-context-checker.sh -c /path/to/context --runtime-probe --runtime-probe-build-option "--secret=id=maven_settings,src=/secure/settings.xml"
 ```
 
+JBoss EAP 8.1コンテナを実際に起動し、起動ログからサーバー起動成功、WARデプロイ成功、デプロイされたWARファイル名を確認したい場合は、既定では無効のEAP起動プローブを明示的に有効化します。詳細は [EAP_STARTUP_PROBE_USAGE.md](EAP_STARTUP_PROBE_USAGE.md) を参照してください。
+
+```bash
+./docker-context-checker.sh -c /path/to/context --eap-startup-probe
+./docker-context-checker.sh -c /path/to/context --eap-startup-probe --eap-startup-timeout 240 --eap-startup-run-option "-e=APP_ENV=test"
+```
+
 ## 主なチェック
 
 - マルチステージ `FROM ... AS ...` と `COPY --from=` の参照チェック
 - `COPY` / `ADD` 元リソースの存在、`.dockerignore` 除外、未参照リソースの検出
 - `RUN --mount=type=secret` のBuildKit build secrets構文、`id=`、`target=`/`env=`、`required=true` などの検出とチェック
 - Dockerfile final stageでのkshセットアップ状況と、任意のDocker実行プローブによるksh/java実行確認
+- 任意のDocker起動プローブによるJBoss EAP 8.1起動成功ログ、WARデプロイ成功ログ、デプロイWAR名の確認
 - ビルドコンテキスト内シンボリックリンクの破損やコンテキスト外参照
 - `RUN ln -s` はビルドフェーズ、entrypoint や呼び出しシェル内の `ln -s` は実行フェーズとして表示
 - entrypoint と呼び出し先シェルの変数チェック
