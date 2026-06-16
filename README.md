@@ -56,6 +56,19 @@ Dockerfileやシェルスクリプトで利用している変数の棚卸しは�
 No, VariableName, Category, Action, Phase, File, Line, ConfiguredValue, Note
 ```
 
+ECSタスク定義で外から設定する必要、または環境ごとに上書きする可能性がある環境変数は、既定で `docker-context-checker-ecs-env.csv` にUTF-8 BOM付きCSVとして出力します。Dockerfileの `ENV`、entrypointや呼び出し先シェルの `${VAR:?message}` / `${VAR:-default}` / 未初期化参照、WildFly/JBoss CLIファイル内の `${env.NAME}` などを検出し、ECSタスク定義では `environment` に置くべきか、機密値として `secrets` に置くべきかも分類します。
+
+```bash
+./docker-context-checker.sh -c /path/to/context --ecs-env-output ecs-env.csv
+./docker-context-checker.sh -c /path/to/context --no-ecs-env-output
+```
+
+ECS環境変数CSV列:
+
+```text
+No, EnvironmentName, Requirement, Source, TaskDefinitionField, File, Line, CurrentValue, DefaultValue, Reason, Evidence
+```
+
 Dockerfileやシェルスクリプトでインストール/セットアップしているソフトウェアの棚卸しは、既定で `docker-context-checker-software.csv` にUTF-8 BOM付きCSVとして出力します。ベースイメージ、Javaバージョンの推定情報、パッケージマネージャで導入しているOSパッケージ、ダウンロード/展開しているアーカイブ、WildFly/JBoss設定、取り込んでいるJDBCドライバJARやjboss-cliのdriver設定を一覧化します。
 
 ```bash
@@ -86,6 +99,7 @@ No, Domain, Component, SettingItem, Description, ConfiguredValue, RecommendedSet
 
 - マルチステージ `FROM ... AS ...` と `COPY --from=` の参照チェック
 - `COPY` / `ADD` 元リソースの存在、`.dockerignore` 除外、未参照リソースの検出
+- `RUN --mount=type=secret` のBuildKit build secrets構文、`id=`、`target=`/`env=`、`required=true` などの検出とチェック
 - ビルドコンテキスト内シンボリックリンクの破損やコンテキスト外参照
 - `RUN ln -s` はビルドフェーズ、entrypoint や呼び出しシェル内の `ln -s` は実行フェーズとして表示
 - entrypoint と呼び出し先シェルの変数チェック
@@ -94,6 +108,7 @@ No, Domain, Component, SettingItem, Description, ConfiguredValue, RecommendedSet
   - 初期化前利用
   - 初期値なしで外部から受け取る必要がある疑い
   - `${VAR:?message}` による必須外部変数
+- ECSタスク定義から渡すべき、または渡せる可能性がある環境変数とSecret候補の一覧化
 - `jboss-cli.sh --file=...` の CLI ファイル検出
 - CLI ファイルの括弧・引用符の構文ヒューリスティック、JNDI 名や naming binding の設定値チェック
 - final stage が UBI 9.6 の場合の runtime 整合性チェック

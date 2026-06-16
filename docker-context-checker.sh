@@ -23,6 +23,8 @@ SOFTWARE_REPORT_ENABLED=1
 SOFTWARE_REPORT_FILE=""
 CONFIG_REPORT_ENABLED=1
 CONFIG_REPORT_FILE=""
+ECS_ENV_REPORT_ENABLED=1
+ECS_ENV_REPORT_FILE=""
 
 declare -a F_SEV=()
 declare -a F_PHASE=()
@@ -104,6 +106,18 @@ declare -a CFG_LINE=()
 declare -a CFG_EVIDENCE=()
 declare -A CFG_SEEN=()
 
+declare -a ECS_ENV_NAME=()
+declare -a ECS_ENV_REQUIREMENT=()
+declare -a ECS_ENV_SOURCE=()
+declare -a ECS_ENV_FILE=()
+declare -a ECS_ENV_LINE=()
+declare -a ECS_ENV_CURRENT_VALUE=()
+declare -a ECS_ENV_DEFAULT_VALUE=()
+declare -a ECS_ENV_TASKDEF_FIELD=()
+declare -a ECS_ENV_REASON=()
+declare -a ECS_ENV_EVIDENCE=()
+declare -A ECS_ENV_SEEN=()
+
 FINAL_STAGE=-1
 FINAL_BASE=""
 FINAL_WORKDIR="/"
@@ -142,6 +156,9 @@ Options:
                            Default: ./docker-context-checker-software.csv.
       --config-output FILE Write Java/JBoss setting audit CSV.
                            Default: ./docker-context-checker-config.csv.
+      --ecs-env-output FILE
+                           Write ECS task definition environment inventory CSV.
+                           Default: ./docker-context-checker-ecs-env.csv.
       --include-unused-all Report every unreferenced file in the build context.
       --fail-on LEVEL      error, warn, or never. Default: error.
       --no-progress        Do not print phase-by-phase progress messages.
@@ -151,6 +168,7 @@ Options:
                            Do not write the variable inventory CSV.
       --no-software-output Do not write the software inventory CSV.
       --no-config-output   Do not write the Java/JBoss setting audit CSV.
+      --no-ecs-env-output  Do not write the ECS environment inventory CSV.
       --no-color           Disable ANSI colors.
   -h, --help               Show this help.
       --version            Show version.
@@ -162,6 +180,9 @@ Checks include:
     are runtime phase.
   - Entrypoint and called shell variable checks: unused, empty initialization,
     use-before-init, required external values, and values without defaults.
+  - Dockerfile BuildKit build secret mount syntax and required=true checks.
+  - ECS task definition environment/secrets candidates detected from Dockerfile,
+    entrypoint shells, and WildFly/JBoss CLI expressions.
   - WildFly jboss-cli --file / --commands detection, CLI file syntax heuristics,
     and JNDI setting validation.
   - UBI 9.6 final image consistency, especially runtime entrypoint behavior.
@@ -315,6 +336,71 @@ add_config_record() {
   CFG_FILE+=("$file")
   CFG_LINE+=("$line")
   CFG_EVIDENCE+=("$evidence")
+}
+
+is_secret_like_var() {
+  local name
+  name="$(lower "$1")"
+  case "$name" in
+    *password*|*passwd*|*pwd*|*secret*|*token*|*credential*|*apikey*|*api_key*|*access_key*|*secret_key*|*private_key*|*cert*|*keystore*|*truststore*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+ecs_taskdef_field_for_var() {
+  if is_secret_like_var "$1"; then
+    printf 'containerDefinitions[].secrets'
+  else
+    printf 'containerDefinitions[].environment'
+  fi
+}
+
+should_report_docker_env_for_ecs() {
+  local name="$1" lname
+  lname="$(lower "$name")"
+  case "$name" in
+    PATH|HOME|PWD|OLDPWD|SHELL|USER|LOGNAME|HOSTNAME|LANG|LC_ALL|TERM|TMPDIR)
+      return 1
+      ;;
+    JAVA_HOME|JBOSS_HOME|WILDFLY_HOME)
+      return 0
+      ;;
+  esac
+  if is_java_option_variable "$name" || is_secret_like_var "$name"; then
+    return 0
+  fi
+  case "$lname" in
+    *db*|*database*|*jdbc*|*url*|*host*|*port*|*endpoint*|*profile*|*env*|*stage*|*region*|*queue*|*topic*|*bucket*|*java*|*jvm*|*jboss*|*wildfly*)
+      return 0
+      ;;
+  esac
+  return 0
+}
+
+add_ecs_env_record() {
+  local name="$1" requirement="$2" source="$3" file="$4" line="$5" current_value="$6" default_value="$7" reason="$8" evidence="$9"
+  local field key
+  [[ -z "$name" ]] && return 0
+  [[ -z "$line" || "$line" == "0" ]] && line="-"
+  field="$(ecs_taskdef_field_for_var "$name")"
+  if is_secret_like_var "$name"; then
+    reason="$reason Use ECS secrets with Secrets Manager or SSM Parameter Store rather than plain environment when the value is sensitive."
+  fi
+  key="$name|$requirement|$source|$file|$line|$evidence"
+  [[ -n "${ECS_ENV_SEEN[$key]:-}" ]] && return 0
+  ECS_ENV_SEEN["$key"]=1
+  ECS_ENV_NAME+=("$name")
+  ECS_ENV_REQUIREMENT+=("$requirement")
+  ECS_ENV_SOURCE+=("$source")
+  ECS_ENV_FILE+=("$file")
+  ECS_ENV_LINE+=("$line")
+  ECS_ENV_CURRENT_VALUE+=("$current_value")
+  ECS_ENV_DEFAULT_VALUE+=("$default_value")
+  ECS_ENV_TASKDEF_FIELD+=("$field")
+  ECS_ENV_REASON+=("$reason")
+  ECS_ENV_EVIDENCE+=("$evidence")
 }
 
 is_number() {
@@ -812,6 +898,12 @@ parse_args() {
         CONFIG_REPORT_ENABLED=1
         shift 2
         ;;
+      --ecs-env-output)
+        [[ $# -ge 2 ]] || die "$1 requires a file"
+        ECS_ENV_REPORT_FILE="$2"
+        ECS_ENV_REPORT_ENABLED=1
+        shift 2
+        ;;
       --include-unused-all)
         INCLUDE_UNUSED_ALL=1
         shift
@@ -847,6 +939,10 @@ parse_args() {
         ;;
       --no-config-output)
         CONFIG_REPORT_ENABLED=0
+        shift
+        ;;
+      --no-ecs-env-output)
+        ECS_ENV_REPORT_ENABLED=0
         shift
         ;;
       --version)
@@ -1372,6 +1468,31 @@ extract_var_refs() {
   }'
 }
 
+extract_env_expr_refs() {
+  awk '
+  {
+    s=$0
+    for (i=1; i<=length(s); i++) {
+      if (substr(s,i,2) == "${") {
+        j=i+2; expr=""
+        while (j<=length(s) && substr(s,j,1)!="}") {
+          expr=expr substr(s,j,1); j++
+        }
+        if (j>length(s)) continue
+        if (expr ~ /^env\.[A-Za-z_][A-Za-z0-9_]*(:[^}]*)?$/) {
+          sub(/^env\./, "", expr)
+          split(expr, parts, /[:-]/)
+          print parts[1] "|wildfly-env-expression"
+        } else if (expr ~ /^[A-Za-z_][A-Za-z0-9_]*(:[^}]*)?$/) {
+          split(expr, parts, /[:-]/)
+          print parts[1] "|expression"
+        }
+        i=j
+      }
+    }
+  }'
+}
+
 is_standard_env_var() {
   case "$1" in
     PATH|HOME|PWD|OLDPWD|SHELL|USER|LOGNAME|HOSTNAME|LANG|LC_ALL|TERM|TMPDIR|TZ|UID|EUID|BASH|BASH_SOURCE|BASH_VERSION|LINENO|RANDOM|SECONDS|IFS|OPTIND|OPTARG|JAVA_HOME|JBOSS_HOME|WILDFLY_HOME|LAUNCH_JBOSS_IN_BACKGROUND)
@@ -1399,6 +1520,13 @@ parse_env_instruction() {
       DOCKER_ENV["$key"]="$value"
       DOCKER_ENV_LINE["$key"]="$line"
       add_var_record "$key" "Dockerfile ENV" "define" "$DOCKERFILE_PATH" "$line" "$value" "build:dockerfile" "Legacy ENV key value form; exported into the image environment."
+      if should_report_docker_env_for_ecs "$key"; then
+        if [[ -z "$value" || "$value" == '""' || "$value" == "''" ]]; then
+          add_ecs_env_record "$key" "required_or_expected" "Dockerfile ENV empty/defaultless" "$DOCKERFILE_PATH" "$line" "$value" "" "Dockerfile defines this ENV as empty, so ECS task definition likely needs to provide the runtime value." "$body"
+        else
+          add_ecs_env_record "$key" "optional_override" "Dockerfile ENV default" "$DOCKERFILE_PATH" "$line" "$value" "$value" "Dockerfile provides a default ENV value, but ECS task definition can override it per environment." "$body"
+        fi
+      fi
       if is_java_option_variable "$key"; then
         scan_java_parameters "$value" "Dockerfile ENV $key" "build:dockerfile" "$DOCKERFILE_PATH" "$line"
       fi
@@ -1425,6 +1553,13 @@ parse_env_instruction() {
     DOCKER_ENV["$key"]="$value"
     DOCKER_ENV_LINE["$key"]="$line"
     add_var_record "$key" "Dockerfile ENV" "define" "$DOCKERFILE_PATH" "$line" "$value" "build:dockerfile" "ENV value exported into the image environment."
+    if should_report_docker_env_for_ecs "$key"; then
+      if [[ -z "$value" || "$value" == '""' || "$value" == "''" ]]; then
+        add_ecs_env_record "$key" "required_or_expected" "Dockerfile ENV empty/defaultless" "$DOCKERFILE_PATH" "$line" "$value" "" "Dockerfile defines this ENV as empty, so ECS task definition likely needs to provide the runtime value." "$word"
+      else
+        add_ecs_env_record "$key" "optional_override" "Dockerfile ENV default" "$DOCKERFILE_PATH" "$line" "$value" "$value" "Dockerfile provides a default ENV value, but ECS task definition can override it per environment." "$word"
+      fi
+    fi
     if is_java_option_variable "$key"; then
       scan_java_parameters "$value" "Dockerfile ENV $key" "build:dockerfile" "$DOCKERFILE_PATH" "$line"
     fi
@@ -1503,6 +1638,79 @@ detect_symlink_command() {
   local text="$1"
   local re='(^|[[:space:];|&])ln[[:space:]][^#;|&]*-[A-Za-z]*s'
   [[ "$text" =~ $re ]]
+}
+
+check_build_secret_mounts() {
+  local body="$1" line="$2" stage="$3"
+  local -a words=()
+  local -a mount_parts=()
+  local word spec item key value id target env required mode seen_secret=0
+  # shellcheck disable=SC2206
+  words=($body)
+  for word in "${words[@]}"; do
+    [[ "$word" == --mount=* ]] || continue
+    spec="${word#--mount=}"
+    [[ "$spec" == *"type=secret"* ]] || continue
+    seen_secret=1
+    id=""
+    target=""
+    env=""
+    required=""
+    mode=""
+    IFS=',' read -r -a mount_parts <<< "$spec"
+    for item in "${mount_parts[@]}"; do
+      key="${item%%=*}"
+      value=""
+      [[ "$item" == *=* ]] && value="${item#*=}"
+      case "$key" in
+        type)
+          [[ "$value" == "secret" ]] || add_finding "ERROR" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SEC001" "RUN --mount uses type='$value' but this checker expected type=secret."
+          ;;
+        id)
+          id="$value"
+          [[ "$id" =~ ^[A-Za-z0-9_.-]+$ ]] || add_finding "WARN" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SEC002" "Build secret id '$id' contains unusual characters; keep ids simple for docker build --secret and CI mapping."
+          ;;
+        target|dst|destination)
+          target="$value"
+          [[ "$target" == /* ]] || add_finding "WARN" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SEC003" "Build secret target '$target' is not an absolute container path."
+          ;;
+        env)
+          env="$value"
+          [[ "$env" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || add_finding "WARN" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SEC004" "Build secret env target '$env' is not a valid environment variable name."
+          ;;
+        required)
+          required="$value"
+          [[ "$required" == "true" || "$required" == "false" ]] || add_finding "ERROR" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SEC005" "Build secret required option must be true or false, got '$required'."
+          ;;
+        mode)
+          mode="$value"
+          [[ "$mode" =~ ^0?[0-7]{3,4}$ ]] || add_finding "WARN" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SEC006" "Build secret mode '$mode' is not an octal permission such as 0400."
+          ;;
+        uid|gid)
+          [[ "$value" =~ ^[0-9]+$ ]] || add_finding "WARN" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SEC007" "Build secret $key value '$value' should be numeric."
+          ;;
+        source|src)
+          add_finding "WARN" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SEC008" "Dockerfile secret mounts should not specify '$key'; provide source mapping with docker build --secret outside the Dockerfile."
+          ;;
+        *)
+          add_finding "INFO" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SEC009" "Unknown build secret mount option '$key'; verify BuildKit supports it."
+          ;;
+      esac
+    done
+    if [[ -z "$id" ]]; then
+      add_finding "WARN" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SEC010" "Build secret mount has no id= option; define an explicit id to map from docker build --secret or CI."
+    fi
+    if [[ -z "$target" && -z "$env" ]]; then
+      add_finding "INFO" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SEC011" "Build secret '$id' uses BuildKit default target /run/secrets/<id>."
+    fi
+    if [[ "$required" != "true" ]]; then
+      add_finding "WARN" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SEC012" "Build secret '${id:-unknown}' is not marked required=true; builds may silently proceed without the secret."
+    fi
+    add_finding "INFO" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SEC013" "BuildKit build secret mount detected: id='${id:-}' target='${target:-}' env='${env:-}' required='${required:-false}'."
+  done
+  if [[ "$body" == *"type=secret"* && "$seen_secret" -eq 0 ]]; then
+    add_finding "WARN" "build:stage-$stage" "$DOCKERFILE_PATH" "$line" "SEC014" "Line contains type=secret but no RUN --mount=type=secret option was parsed; verify Dockerfile BuildKit syntax."
+  fi
 }
 
 find_context_by_basename() {
@@ -1760,6 +1968,7 @@ analyze_dockerfile() {
         parse_copy_add_instruction "$inst" "$body" "$line" "$stage" "$workdir"
         ;;
       RUN)
+        check_build_secret_mounts "$body" "$line" "$stage"
         scan_software_commands "$body" "$DOCKERFILE_PATH" "$line" "build:stage-$stage"
         scan_java_parameters "$body" "Dockerfile RUN" "build:stage-$stage" "$DOCKERFILE_PATH" "$line"
         if detect_symlink_command "$body"; then
@@ -2097,10 +2306,18 @@ scan_shell_file() {
       [[ "$kind" == "required" ]] && note="Reference requires external/runtime value."
       add_var_record "$var" "$category" "$kind" "$file" "$no" "$detail" "runtime:$rel" "$note"
       if [[ "$kind" == "required" ]]; then
+        add_ecs_env_record "$var" "required" "shell required expansion" "$file" "$no" "" "$detail" "Shell parameter expansion requires this variable at container runtime. Set it from ECS task definition." "$code"
         add_finding "WARN" "runtime:$rel" "$file" "$no" "VAR011" "Variable '$var' is required from outside or earlier initialization via \${$var:?...}."
+      elif [[ "$kind" == "default" ]]; then
+        if [[ -z "${assigned_line[$var]:-}" ]] && ! is_standard_env_var "$var"; then
+          add_ecs_env_record "$var" "optional_override" "shell default expansion" "$file" "$no" "" "$detail" "Shell provides an inline default, but ECS task definition can override this value per environment." "$code"
+        fi
       elif [[ "$kind" == "plain" || "$kind" == "alternate" ]]; then
         if [[ -z "${assigned_line[$var]:-}" && ! -v DOCKER_ENV[$var] ]] && ! is_standard_env_var "$var"; then
+          add_ecs_env_record "$var" "likely_required" "shell external reference" "$file" "$no" "" "" "Shell references this variable without local initialization or Dockerfile ENV. Set it from ECS task definition if the application expects it." "$code"
           add_finding "WARN" "runtime:$rel" "$file" "$no" "VAR012" "Variable '$var' is used without local initialization, Dockerfile ENV, or a default; it likely must be supplied from outside."
+        elif [[ -v DOCKER_ENV[$var] ]] && ! is_standard_env_var "$var"; then
+          add_ecs_env_record "$var" "optional_override" "Dockerfile ENV used at runtime" "$file" "$no" "${DOCKER_ENV[$var]}" "${DOCKER_ENV[$var]}" "Dockerfile provides this ENV and the shell uses it; ECS task definition can override it per deployment." "$code"
         elif [[ -n "${assigned_line[$var]:-}" && "${assigned_line[$var]}" -gt "$no" ]]; then
           add_finding "WARN" "runtime:$rel" "$file" "$no" "VAR013" "Variable '$var' is used before its first initialization on line ${assigned_line[$var]}."
         fi
@@ -2141,6 +2358,25 @@ count_char() {
 extract_cli_value() {
   local key="$1" text="$2"
   sed -n "s/.*$key[[:space:]]*=[[:space:]]*['\"]\\{0,1\\}\\([^,'\")[:space:]]*\\).*/\\1/p" <<< "$text" | head -n 1
+}
+
+scan_ecs_env_expressions() {
+  local text="$1" file="$2" line="$3" phase="$4" source="$5"
+  local ref name kind
+  while IFS= read -r ref; do
+    [[ -z "$ref" ]] && continue
+    name="${ref%%|*}"
+    kind="${ref#*|}"
+    [[ -z "$name" ]] && continue
+    if is_standard_env_var "$name"; then
+      continue
+    fi
+    if [[ "$kind" == "wildfly-env-expression" ]]; then
+      add_ecs_env_record "$name" "required_or_expected" "$source env expression" "$file" "$line" "" "" "WildFly/JBoss CLI references this environment variable with an expression. Provide it from the ECS task definition when the CLI runs at container startup." "$text"
+    else
+      add_ecs_env_record "$name" "possible" "$source expression" "$file" "$line" "" "" "Configuration contains a variable expression. If it is resolved from the process environment, provide it from the ECS task definition." "$text"
+    fi
+  done < <(printf '%s\n' "$text" | extract_env_expr_refs)
 }
 
 extract_cli_subsystem() {
@@ -2445,6 +2681,7 @@ check_cli_line() {
   local re_lookup_param='(^|[,(]|[[:space:]])lookup[[:space:]]*='
   code="$(trim "${line_text%%#*}")"
   [[ -z "$code" ]] && return 0
+  scan_ecs_env_expressions "$code" "$file" "$line" "$phase" "WildFly/JBoss CLI"
   scan_jboss_cli_settings "$code" "$file" "$line" "$phase"
 
   dquotes=$(awk '{
@@ -2579,6 +2816,7 @@ check_item_for_code() {
     EP*) printf 'Entrypoint resolution' ;;
     SH*) printf 'Called shell script relation' ;;
     VAR*) printf 'Shell and Dockerfile variable usage' ;;
+    SEC*) printf 'Dockerfile BuildKit build secrets' ;;
     UBI*) printf 'UBI 9.6 runtime consistency' ;;
     CLI*) printf 'WildFly jboss-cli syntax' ;;
     JNDI*) printf 'WildFly JNDI configuration' ;;
@@ -2628,6 +2866,10 @@ suggestion_for_code() {
     VAR007|VAR011) printf '外部から必須で受け取る変数です。環境変数、secret、起動引数、CI設定のいずれで渡すか明記してください。' ;;
     VAR008|VAR012|VAR013) printf '利用前に初期化するか、${VAR:-default}のような既定値、または${VAR:?message}の必須チェックを追加してください。' ;;
     VAR009|VAR014|VAR015) printf '不要なら削除し、子プロセス向けに必要なら用途をコメントや命名で明確にしてください。' ;;
+    SEC001|SEC005) printf 'BuildKit secret mount option syntax is invalid. Fix RUN --mount=type=secret options before building.' ;;
+    SEC002|SEC003|SEC004|SEC006|SEC007|SEC008|SEC009|SEC010|SEC014) printf 'Review RUN --mount=type=secret syntax. Use explicit id=, absolute target= or valid env=, octal mode, numeric uid/gid, and pass source values outside the Dockerfile with docker build --secret.' ;;
+    SEC011|SEC013) printf 'Build secret usage was detected. Ensure CI/build command passes matching --secret id=... and the secret is not copied into image layers.' ;;
+    SEC012) printf 'Consider required=true for mandatory build secrets so builds fail instead of silently proceeding without credentials.' ;;
     UBI001|UBI002) printf 'RHEL/UBI 9.6前提ならベースイメージタグを9.6に固定してください。' ;;
     UBI003|UBI004) printf 'UBI minimalではmicrodnf利用とキャッシュ削除を確認してください。パッケージ導入はDockerfileビルド時に寄せるのが基本です。' ;;
     UBI005|UBI012) printf 'subscription-managerに依存しない構成へ見直してください。UBIコンテナはホスト購読状態へ依存させない方が移植性があります。' ;;
@@ -2743,6 +2985,7 @@ write_report_file() {
   write_summary_csv_row serial "ENTRYPOINT/CMD解決" "EP"
   write_summary_csv_row serial "呼び出しシェル関連" "SH"
   write_summary_csv_row serial "変数利用/初期化" "VAR"
+  write_summary_csv_row serial "Dockerfile BuildKit build secrets" "SEC"
   write_summary_csv_row serial "WildFly jboss-cli構文" "CLI"
   write_summary_csv_row serial "WildFly JNDI設定" "JNDI"
   write_summary_csv_row serial "UBI 9.6 runtime整合性" "UBI"
@@ -2906,6 +3149,33 @@ write_config_report_file() {
   done
 }
 
+write_ecs_env_report_file() {
+  (( ECS_ENV_REPORT_ENABLED )) || return 0
+  local dir i file current_value default_value
+  dir="$(dirname -- "$ECS_ENV_REPORT_FILE")"
+  mkdir -p -- "$dir"
+  progress_log "OUTPUT" "Writing Excel ECS environment inventory CSV: $ECS_ENV_REPORT_FILE"
+  printf '\xEF\xBB\xBF' > "$ECS_ENV_REPORT_FILE"
+  write_csv_row_to_file "$ECS_ENV_REPORT_FILE" \
+    "No" "EnvironmentName" "Requirement" "Source" "TaskDefinitionField" "File" "Line" "CurrentValue" "DefaultValue" "Reason" "Evidence"
+
+  if (( ${#ECS_ENV_NAME[@]} == 0 )); then
+    write_csv_row_to_file "$ECS_ENV_REPORT_FILE" \
+      "1" "-" "No ECS environment candidates detected" "-" "-" "-" "-" "-" "-" "No Dockerfile ENV, shell runtime variable, or WildFly/JBoss CLI expression candidate was detected." "-"
+    return 0
+  fi
+
+  for ((i=0; i<${#ECS_ENV_NAME[@]}; i++)); do
+    file="$(display_path "${ECS_ENV_FILE[$i]}")"
+    current_value="${ECS_ENV_CURRENT_VALUE[$i]}"
+    default_value="${ECS_ENV_DEFAULT_VALUE[$i]}"
+    [[ -z "$current_value" ]] && current_value="(not configured in source)"
+    [[ -z "$default_value" ]] && default_value="(none detected)"
+    write_csv_row_to_file "$ECS_ENV_REPORT_FILE" \
+      "$((i + 1))" "${ECS_ENV_NAME[$i]}" "${ECS_ENV_REQUIREMENT[$i]}" "${ECS_ENV_SOURCE[$i]}" "${ECS_ENV_TASKDEF_FIELD[$i]}" "$file" "${ECS_ENV_LINE[$i]}" "$current_value" "$default_value" "${ECS_ENV_REASON[$i]}" "${ECS_ENV_EVIDENCE[$i]}"
+  done
+}
+
 print_header() {
   local stages stage_label
   stages=$((FINAL_STAGE + 1))
@@ -2941,6 +3211,9 @@ print_header() {
   fi
   if (( CONFIG_REPORT_ENABLED )); then
     printf 'Config     : %s\n' "$CONFIG_REPORT_FILE"
+  fi
+  if (( ECS_ENV_REPORT_ENABLED )); then
+    printf 'ECS env    : %s\n' "$ECS_ENV_REPORT_FILE"
   fi
   printf '\n'
 }
@@ -3001,6 +3274,10 @@ main() {
     [[ -z "$CONFIG_REPORT_FILE" ]] && CONFIG_REPORT_FILE="$PWD/docker-context-checker-config.csv"
     CONFIG_REPORT_FILE="$(abs_path "$CONFIG_REPORT_FILE")"
   fi
+  if (( ECS_ENV_REPORT_ENABLED )); then
+    [[ -z "$ECS_ENV_REPORT_FILE" ]] && ECS_ENV_REPORT_FILE="$PWD/docker-context-checker-ecs-env.csv"
+    ECS_ENV_REPORT_FILE="$(abs_path "$ECS_ENV_REPORT_FILE")"
+  fi
 
   progress_log "START" "Context=$CONTEXT_DIR Dockerfile=$DOCKERFILE_PATH"
   progress_log "CHECK" "Loading .dockerignore patterns"
@@ -3022,6 +3299,7 @@ main() {
   write_variable_report_file
   write_software_report_file
   write_config_report_file
+  write_ecs_env_report_file
   print_report
 
   case "$FAIL_ON" in
