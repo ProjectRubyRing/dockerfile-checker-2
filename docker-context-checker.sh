@@ -25,6 +25,11 @@ CONFIG_REPORT_ENABLED=1
 CONFIG_REPORT_FILE=""
 ECS_ENV_REPORT_ENABLED=1
 ECS_ENV_REPORT_FILE=""
+RUNTIME_PROBE_ENABLED=0
+RUNTIME_PROBE_IMAGE=""
+RUNTIME_PROBE_KEEP_IMAGE=0
+RUNTIME_PROBE_IMAGE_CUSTOM=0
+declare -a RUNTIME_PROBE_BUILD_OPTIONS=()
 
 declare -a F_SEV=()
 declare -a F_PHASE=()
@@ -131,6 +136,11 @@ FINAL_IS_UBI9=0
 FINAL_IS_UBI96=0
 FINAL_IS_UBI_MINIMAL=0
 FINAL_INSTALLS_BASH=0
+FINAL_INSTALLS_KSH=0
+FINAL_INSTALLS_JAVA=0
+FINAL_NEEDS_KSH=0
+FINAL_NEEDS_JAVA=0
+FINAL_DOCKERFILE_SHELL_KSH=0
 
 usage() {
   cat <<'USAGE'
@@ -159,6 +169,16 @@ Options:
       --ecs-env-output FILE
                            Write ECS task definition environment inventory CSV.
                            Default: ./docker-context-checker-ecs-env.csv.
+      --runtime-probe      Build the Docker image and run ksh/java executable probes.
+                           Disabled by default because it starts Docker.
+      --runtime-probe-image TAG
+                           Image tag to use for --runtime-probe.
+                           Default: docker-context-checker-probe:<timestamp>-<pid>.
+      --runtime-probe-build-option ARG
+                           Extra docker build option for --runtime-probe.
+                           Repeat for secrets, build args, network options, etc.
+      --runtime-probe-keep-image
+                           Keep the temporary probe image after checks.
       --include-unused-all Report every unreferenced file in the build context.
       --fail-on LEVEL      error, warn, or never. Default: error.
       --no-progress        Do not print phase-by-phase progress messages.
@@ -169,6 +189,7 @@ Options:
       --no-software-output Do not write the software inventory CSV.
       --no-config-output   Do not write the Java/JBoss setting audit CSV.
       --no-ecs-env-output  Do not write the ECS environment inventory CSV.
+      --no-runtime-probe   Disable Docker runtime probes.
       --no-color           Disable ANSI colors.
   -h, --help               Show this help.
       --version            Show version.
@@ -183,6 +204,7 @@ Checks include:
   - Dockerfile BuildKit build secret mount syntax and required=true checks.
   - ECS task definition environment/secrets candidates detected from Dockerfile,
     entrypoint shells, and WildFly/JBoss CLI expressions.
+  - Optional Docker runtime probe for ksh and java executability.
   - WildFly jboss-cli --file / --commands detection, CLI file syntax heuristics,
     and JNDI setting validation.
   - UBI 9.6 final image consistency, especially runtime entrypoint behavior.
@@ -401,6 +423,56 @@ add_ecs_env_record() {
   ECS_ENV_TASKDEF_FIELD+=("$field")
   ECS_ENV_REASON+=("$reason")
   ECS_ENV_EVIDENCE+=("$evidence")
+}
+
+compact_output() {
+  local s="$1"
+  s="${s//$'\r'/ }"
+  s="${s//$'\n'/ | }"
+  while [[ "$s" == *"  "* ]]; do
+    s="${s//  / }"
+  done
+  if ((${#s} > 700)); then
+    s="${s:0:700}..."
+  fi
+  printf '%s' "$s"
+}
+
+is_final_build_phase() {
+  [[ "$1" == "build:stage-$FINAL_STAGE" || "$1" == "build:final-stage" ]]
+}
+
+is_ksh_package_name() {
+  local name
+  name="$(lower "$1")"
+  case "$name" in
+    ksh|ksh-*|*ksh-20*|mksh|pdksh)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+is_java_package_name() {
+  local name
+  name="$(lower "$1")"
+  if [[ -n "$(infer_java_version_from_text "$name")" ]]; then
+    return 0
+  fi
+  case "$name" in
+    java|java-*|openjdk|openjdk-*|jdk|jdk-*|jre|jre-*|*java-runtime*|*java-devel*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+runtime_probe_expected_ksh() {
+  (( FINAL_INSTALLS_KSH || FINAL_NEEDS_KSH || FINAL_DOCKERFILE_SHELL_KSH ))
+}
+
+runtime_probe_expected_java() {
+  (( FINAL_INSTALLS_JAVA || FINAL_NEEDS_JAVA ))
 }
 
 is_number() {
@@ -746,9 +818,22 @@ record_installed_package() {
   fi
   add_software_record "$clean" "os-package" "$version" "$manager install" "$phase" "$file" "$line" "$evidence" "Package installed or requested by package manager."
 
+  if is_ksh_package_name "$clean"; then
+    add_software_record "ksh" "shell-runtime-package" "$version" "$manager install package" "$phase" "$file" "$line" "$clean" "KornShell/ksh package inferred from installed package name."
+    if is_final_build_phase "$phase"; then
+      FINAL_INSTALLS_KSH=1
+      add_finding "INFO" "$phase" "$file" "$line" "KSH001" "Dockerfile final stage installs or requests ksh package '$clean'."
+    elif [[ "$phase" == runtime:* ]]; then
+      add_finding "WARN" "$phase" "$file" "$line" "KSH004" "ksh package '$clean' appears to be installed at container runtime; prefer installing it in the Dockerfile build phase."
+    fi
+  fi
+
   java_version="$(infer_java_version_from_text "$clean")"
   if [[ -n "$java_version" ]]; then
     add_software_record "Java" "java-runtime-package" "$java_version" "$manager install package" "$phase" "$file" "$line" "$clean" "Java version inferred from installed package name."
+  fi
+  if is_java_package_name "$clean" && is_final_build_phase "$phase"; then
+    FINAL_INSTALLS_JAVA=1
   fi
 
   vendor="$(infer_db_driver_vendor "$clean")"
@@ -838,9 +923,20 @@ scan_software_commands() {
         add_software_record "WildFly/JBoss CLI" "application-server-management-tool" "" "jboss-cli command" "$phase" "$file" "$line" "$text" "jboss-cli is used to configure WildFly/JBoss."
         ;;
       java)
+        if is_final_build_phase "$phase" || [[ "$phase" == runtime:* ]]; then
+          FINAL_NEEDS_JAVA=1
+        fi
         if [[ "$text" == *"-version"* ]]; then
           add_software_record "Java" "java-runtime-check" "" "java -version" "$phase" "$file" "$line" "$text" "Java runtime version is checked at build/runtime."
+        else
+          add_software_record "Java" "java-command-reference" "" "java command" "$phase" "$file" "$line" "$text" "Java command is invoked by Dockerfile or shell script."
         fi
+        ;;
+      ksh)
+        if is_final_build_phase "$phase" || [[ "$phase" == runtime:* ]]; then
+          FINAL_NEEDS_KSH=1
+        fi
+        add_software_record "ksh" "shell-command-reference" "" "ksh command" "$phase" "$file" "$line" "$text" "ksh command is invoked by Dockerfile or shell script."
         ;;
     esac
     if [[ "$lname" == *wildfly* || "$lname" == *jboss-eap* ]]; then
@@ -904,6 +1000,28 @@ parse_args() {
         ECS_ENV_REPORT_ENABLED=1
         shift 2
         ;;
+      --runtime-probe)
+        RUNTIME_PROBE_ENABLED=1
+        shift
+        ;;
+      --runtime-probe-image)
+        [[ $# -ge 2 ]] || die "$1 requires an image tag"
+        RUNTIME_PROBE_IMAGE="$2"
+        RUNTIME_PROBE_IMAGE_CUSTOM=1
+        RUNTIME_PROBE_ENABLED=1
+        shift 2
+        ;;
+      --runtime-probe-build-option)
+        [[ $# -ge 2 ]] || die "$1 requires a docker build option"
+        RUNTIME_PROBE_BUILD_OPTIONS+=("$2")
+        RUNTIME_PROBE_ENABLED=1
+        shift 2
+        ;;
+      --runtime-probe-keep-image)
+        RUNTIME_PROBE_KEEP_IMAGE=1
+        RUNTIME_PROBE_ENABLED=1
+        shift
+        ;;
       --include-unused-all)
         INCLUDE_UNUSED_ALL=1
         shift
@@ -943,6 +1061,10 @@ parse_args() {
         ;;
       --no-ecs-env-output)
         ECS_ENV_REPORT_ENABLED=0
+        shift
+        ;;
+      --no-runtime-probe)
+        RUNTIME_PROBE_ENABLED=0
         shift
         ;;
       --version)
@@ -1815,7 +1937,7 @@ discover_shell_refs_in_text() {
           if [[ "$next" == -* && $((i + 2)) -lt ${#words[@]} ]]; then
             next="${words[$((i + 2))]}"
           fi
-          if [[ "$next" == *.sh* || "$next" == ./* || "$next" == /* ]]; then
+          if [[ "$next" == *.sh* || "$next" == *.ksh* || "$next" == ./* || "$next" == /* ]]; then
             if rel="$(resolve_script_reference "$next" "$current_rel" "$line" "$phase" "$workdir")"; then
               add_shell_file "$rel" "called from $phase line $line"
               add_relation "${current_rel:-Dockerfile}" "$rel" "calls line $line" "$phase" "$CONTEXT_DIR/$current_rel" "$line"
@@ -1840,7 +1962,7 @@ discover_shell_refs_in_text() {
           fi
         fi
         ;;
-      *.sh|*.sh\"|*.sh\')
+      *.sh|*.sh\"|*.sh\'|*.ksh|*.ksh\"|*.ksh\')
         if (( i > 0 )); then
           local prev prev_base
           prev="${words[$((i - 1))]}"
@@ -1935,6 +2057,34 @@ check_ubi_run_instruction() {
   fi
 }
 
+check_ksh_run_instruction() {
+  local body="$1" line="$2" stage="$3"
+  (( stage == FINAL_STAGE )) || return 0
+  local lbody re_ksh
+  lbody="$(lower "$body")"
+  re_ksh='(^|[[:space:];&|(/])ksh([[:space:];&|),]|$)'
+  if [[ "$lbody" =~ $re_ksh ]]; then
+    FINAL_NEEDS_KSH=1
+    if (( ! FINAL_INSTALLS_KSH )); then
+      add_finding "WARN" "build:final-stage" "$DOCKERFILE_PATH" "$line" "KSH002" "Final stage uses ksh but ksh setup was not clearly detected earlier in the Dockerfile final stage. Enable --runtime-probe to confirm executability."
+    fi
+  fi
+}
+
+check_ksh_shell_instruction() {
+  local body="$1" line="$2" stage="$3"
+  (( stage == FINAL_STAGE )) || return 0
+  local lbody
+  lbody="$(lower "$body")"
+  if [[ "$lbody" == *"ksh"* ]]; then
+    FINAL_DOCKERFILE_SHELL_KSH=1
+    FINAL_NEEDS_KSH=1
+    if (( ! FINAL_INSTALLS_KSH )); then
+      add_finding "WARN" "build:final-stage" "$DOCKERFILE_PATH" "$line" "KSH003" "Dockerfile SHELL uses ksh, but ksh setup was not clearly detected earlier in the Dockerfile final stage. Enable --runtime-probe to confirm executability."
+    fi
+  fi
+}
+
 analyze_dockerfile() {
   local -a stage_workdir=()
   local i inst body line stage workdir value key user
@@ -1976,6 +2126,10 @@ analyze_dockerfile() {
         fi
         discover_shell_refs_in_text "$body" "" "$line" "build:stage-$stage" "$workdir"
         check_ubi_run_instruction "$body" "$line" "$stage"
+        check_ksh_run_instruction "$body" "$line" "$stage"
+        ;;
+      SHELL)
+        check_ksh_shell_instruction "$body" "$line" "$stage"
         ;;
       ENTRYPOINT)
         if (( stage == FINAL_STAGE )); then
@@ -2053,7 +2207,7 @@ resolve_entrypoint() {
       fi
     fi
   else
-    full="$(find "$CONTEXT_DIR" -path '*/.git' -prune -o -type f \( -iname 'entrypoint.sh' -o -iname '*entrypoint*.sh' \) -print | head -n 1)"
+    full="$(find "$CONTEXT_DIR" -path '*/.git' -prune -o -type f \( -iname 'entrypoint.sh' -o -iname '*entrypoint*.sh' -o -iname 'entrypoint.ksh' -o -iname '*entrypoint*.ksh' \) -print | head -n 1)"
     if [[ -n "$full" ]]; then
       rel="$(rel_to_context "$full")"
       add_shell_file "$rel" "entrypoint filename heuristic"
@@ -2180,14 +2334,21 @@ scan_shell_file() {
     no=$((no + 1))
     line="${line%$'\r'}"
     line="${line#$'\xef\xbb\xbf'}"
-    code="${line%%#*}"
-    [[ -z "$(trim "$code")" ]] && continue
 
     if [[ "$no" == 1 && "$line" =~ ^#!.*bash ]]; then
       if (( FINAL_IS_UBI96 && FINAL_IS_UBI_MINIMAL && ! FINAL_INSTALLS_BASH )); then
         add_finding "WARN" "runtime:$rel" "$file" "$no" "UBI009" "Script shebang requires bash, but final UBI 9.6 minimal stage does not clearly install bash."
       fi
     fi
+    if [[ "$no" == 1 && "$line" =~ ^#!.*ksh ]]; then
+      FINAL_NEEDS_KSH=1
+      if (( ! FINAL_INSTALLS_KSH )); then
+        add_finding "WARN" "runtime:$rel" "$file" "$no" "KSH003" "Script shebang requires ksh, but ksh setup was not clearly detected in the Dockerfile final stage. Enable --runtime-probe to confirm executability."
+      fi
+    fi
+
+    code="${line%%#*}"
+    [[ -z "$(trim "$code")" ]] && continue
 
     if detect_symlink_command "$code"; then
       add_finding "INFO" "runtime:$rel" "$file" "$no" "SYM002" "Symlink creation detected in shell script; this happens during container runtime/startup."
@@ -2796,6 +2957,75 @@ scan_all_cli() {
   done
 }
 
+run_runtime_probe_command() {
+  local image="$1" tool="$2" command="$3" output rc sev message
+  progress_log "PROBE" "Running Docker runtime probe for $tool"
+  output="$(docker run --rm --entrypoint /bin/sh "$image" -c "$command" 2>&1)"
+  rc=$?
+  output="$(compact_output "$output")"
+  case "$tool" in
+    ksh)
+      if (( rc == 0 )); then
+        add_finding "INFO" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP003" "Docker runtime probe succeeded: ksh is executable. Output: $output"
+        add_software_record "ksh" "runtime-probe-executable" "" "docker run probe" "runtime-probe" "$DOCKERFILE_PATH" "-" "$output" "ksh was executed inside the built image."
+      else
+        sev="WARN"
+        runtime_probe_expected_ksh && sev="ERROR"
+        message="Docker runtime probe failed: ksh is not executable or /bin/sh probe command failed. Output: $output"
+        add_finding "$sev" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP004" "$message"
+      fi
+      ;;
+    java)
+      if (( rc == 0 )); then
+        add_finding "INFO" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP005" "Docker runtime probe succeeded: java -version is executable. Output: $output"
+        add_software_record "Java" "runtime-probe-executable" "" "docker run java -version" "runtime-probe" "$DOCKERFILE_PATH" "-" "$output" "java -version was executed inside the built image."
+      else
+        sev="WARN"
+        runtime_probe_expected_java && sev="ERROR"
+        message="Docker runtime probe failed: java is not executable or /bin/sh probe command failed. Output: $output"
+        add_finding "$sev" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP006" "$message"
+      fi
+      ;;
+  esac
+}
+
+run_runtime_probe() {
+  (( RUNTIME_PROBE_ENABLED )) || return 0
+  local image build_output info_output cleanup_output auto_image=0
+  if [[ -z "$RUNTIME_PROBE_IMAGE" ]]; then
+    RUNTIME_PROBE_IMAGE="docker-context-checker-probe:$(date '+%Y%m%d%H%M%S')-$$"
+    auto_image=1
+  fi
+  image="$RUNTIME_PROBE_IMAGE"
+
+  progress_log "PROBE" "Checking Docker CLI and daemon"
+  if ! command -v docker >/dev/null 2>&1; then
+    add_finding "ERROR" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP001" "Docker runtime probe was requested, but docker command was not found in PATH."
+    return 0
+  fi
+  if ! info_output="$(docker info 2>&1)"; then
+    add_finding "ERROR" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP001" "Docker runtime probe was requested, but Docker daemon is not available. Output: $(compact_output "$info_output")"
+    return 0
+  fi
+
+  progress_log "PROBE" "Building Docker image for runtime probe: $image"
+  build_output="$(docker build "${RUNTIME_PROBE_BUILD_OPTIONS[@]}" -f "$DOCKERFILE_PATH" -t "$image" "$CONTEXT_DIR" 2>&1)"
+  if (($? != 0)); then
+    add_finding "ERROR" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP002" "Docker runtime probe image build failed. Output: $(compact_output "$build_output")"
+    return 0
+  fi
+
+  run_runtime_probe_command "$image" "ksh" 'set -e; command -v ksh; ksh -c "print OK_KSH"; (ksh --version 2>&1 || true)'
+  run_runtime_probe_command "$image" "java" 'set -e; command -v java; java -version'
+
+  if (( ! RUNTIME_PROBE_KEEP_IMAGE && auto_image && ! RUNTIME_PROBE_IMAGE_CUSTOM )); then
+    progress_log "PROBE" "Removing temporary runtime probe image: $image"
+    if ! cleanup_output="$(docker image rm "$image" 2>&1)"; then
+      add_finding "INFO" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP007" "Temporary runtime probe image could not be removed automatically. Output: $(compact_output "$cleanup_output")"
+    fi
+  fi
+}
+
 report_unused_context_files() {
   local full rel
   progress_log "CHECK" "Scanning unreferenced build-context files"
@@ -2817,6 +3047,8 @@ check_item_for_code() {
     SH*) printf 'Called shell script relation' ;;
     VAR*) printf 'Shell and Dockerfile variable usage' ;;
     SEC*) printf 'Dockerfile BuildKit build secrets' ;;
+    KSH*) printf 'ksh setup consistency' ;;
+    RTP*) printf 'Docker runtime executable probe' ;;
     UBI*) printf 'UBI 9.6 runtime consistency' ;;
     CLI*) printf 'WildFly jboss-cli syntax' ;;
     JNDI*) printf 'WildFly JNDI configuration' ;;
@@ -2870,6 +3102,15 @@ suggestion_for_code() {
     SEC002|SEC003|SEC004|SEC006|SEC007|SEC008|SEC009|SEC010|SEC014) printf 'Review RUN --mount=type=secret syntax. Use explicit id=, absolute target= or valid env=, octal mode, numeric uid/gid, and pass source values outside the Dockerfile with docker build --secret.' ;;
     SEC011|SEC013) printf 'Build secret usage was detected. Ensure CI/build command passes matching --secret id=... and the secret is not copied into image layers.' ;;
     SEC012) printf 'Consider required=true for mandatory build secrets so builds fail instead of silently proceeding without credentials.' ;;
+    KSH001) printf 'ksh setup was detected in the final stage. Use --runtime-probe when you need proof that ksh actually executes in the built image.' ;;
+    KSH002|KSH003) printf 'Install ksh in the final Dockerfile stage, or confirm it is provided by the base image with --runtime-probe.' ;;
+    KSH004) printf 'Move ksh package installation from entrypoint/runtime shell into the Dockerfile build phase.' ;;
+    RTP001) printf 'Install Docker CLI and ensure the Docker daemon is running before using --runtime-probe.' ;;
+    RTP002) printf 'Fix the Docker build failure first. If the Dockerfile needs secrets or build args, pass them with repeated --runtime-probe-build-option arguments.' ;;
+    RTP003|RTP005) printf 'Runtime executable probe succeeded. Keep this as evidence that the built image can start the requested runtime command.' ;;
+    RTP004) printf 'Install ksh in the final image, verify PATH and /bin/sh availability, then rerun --runtime-probe.' ;;
+    RTP006) printf 'Install a Java runtime/JDK in the final image, verify PATH/JAVA_HOME, then rerun --runtime-probe.' ;;
+    RTP007) printf 'Remove the temporary probe image manually with docker image rm if it is no longer needed.' ;;
     UBI001|UBI002) printf 'RHEL/UBI 9.6前提ならベースイメージタグを9.6に固定してください。' ;;
     UBI003|UBI004) printf 'UBI minimalではmicrodnf利用とキャッシュ削除を確認してください。パッケージ導入はDockerfileビルド時に寄せるのが基本です。' ;;
     UBI005|UBI012) printf 'subscription-managerに依存しない構成へ見直してください。UBIコンテナはホスト購読状態へ依存させない方が移植性があります。' ;;
@@ -2986,6 +3227,8 @@ write_report_file() {
   write_summary_csv_row serial "呼び出しシェル関連" "SH"
   write_summary_csv_row serial "変数利用/初期化" "VAR"
   write_summary_csv_row serial "Dockerfile BuildKit build secrets" "SEC"
+  write_summary_csv_row serial "ksh setup consistency" "KSH"
+  write_summary_csv_row serial "Docker runtime executable probe" "RTP"
   write_summary_csv_row serial "WildFly jboss-cli構文" "CLI"
   write_summary_csv_row serial "WildFly JNDI設定" "JNDI"
   write_summary_csv_row serial "UBI 9.6 runtime整合性" "UBI"
@@ -3215,6 +3458,9 @@ print_header() {
   if (( ECS_ENV_REPORT_ENABLED )); then
     printf 'ECS env    : %s\n' "$ECS_ENV_REPORT_FILE"
   fi
+  if (( RUNTIME_PROBE_ENABLED )); then
+    printf 'Docker run : runtime probe enabled, image=%s\n' "${RUNTIME_PROBE_IMAGE:-auto}"
+  fi
   printf '\n'
 }
 
@@ -3292,8 +3538,11 @@ main() {
     scan_all_shells
     scan_all_cli
     report_unused_context_files
+    if (( RUNTIME_PROBE_ENABLED )); then
+      run_runtime_probe
+    fi
   fi
-  progress_log "DONE" "Static checks completed"
+  progress_log "DONE" "Checks completed"
   write_report_file
   write_mermaid_file
   write_variable_report_file
