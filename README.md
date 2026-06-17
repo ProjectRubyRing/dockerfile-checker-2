@@ -36,12 +36,16 @@ CSV列:
 No, Result, Severity, CheckCode, CheckItem, Phase, File, Line, Message, Suggestion
 ```
 
-ビルドコンテキスト内の関連図は、既定で `docker-context-relations.mmd` にMermaid形式で出力します。Dockerfileからの `COPY` / `ADD`、`ENTRYPOINT`、シェルからの呼び出し、`jboss-cli --file` 参照をエッジとして書き出します。
+ビルドコンテキスト内の関連図は、既定で `docker-context-relations.mmd` にMermaid形式、`docker-context-relations.txt` にアスキーアート形式で出力します。Dockerfileからの `COPY` / `ADD`、`ENTRYPOINT`、シェルからの呼び出し、`jboss-cli --file` 参照をエッジとして書き出します。
 
 ```bash
 ./docker-context-checker.sh -c /path/to/context --mermaid relations.mmd
+./docker-context-checker.sh -c /path/to/context --ascii-art relations.txt
 ./docker-context-checker.sh -c /path/to/context --no-mermaid
+./docker-context-checker.sh -c /path/to/context --no-ascii-art
 ```
+
+アスキーアート形式は、固定の右罫線を持つ表ではなく、`|--` と ``--` の枝をそろえたグループ別の関係図として出力します。長いファイルパスや説明が含まれても、枝線の位置がずれにくい形式です。
 
 Dockerfileやシェルスクリプトで利用している変数の棚卸しは、既定で `docker-context-checker-variables.csv` にUTF-8 BOM付きCSVとして出力します。ARG、ENV、シェル変数、exportされた環境変数、外部から受け取る必要がある疑いの変数を、ファイル名、行数、設定値、利用形と一緒に出します。
 
@@ -67,6 +71,19 @@ ECS環境変数CSV列:
 
 ```text
 No, EnvironmentName, Requirement, Source, TaskDefinitionField, File, Line, CurrentValue, DefaultValue, Reason, Evidence
+```
+
+Dockerを実際に起動する `--runtime-probe` と `--eap-startup-probe` の結果だけを抜き出したCSVは、既定で `docker-context-checker-container-checks.csv` にUTF-8 BOM付きCSVとして出力します。出力先は `--container-check-output` で指定できます。
+
+```bash
+./docker-context-checker.sh -c /path/to/context --runtime-probe --container-check-output container-checks.csv
+./docker-context-checker.sh -c /path/to/context --eap-startup-probe --container-check-output eap-checks.csv
+```
+
+コンテナ実行チェックCSV列:
+
+```text
+No, Probe, TargetMode, TargetImage, ContainerName, Result, Severity, CheckCode, File, Line, Message, Suggestion
 ```
 
 Dockerfileやシェルスクリプトでインストール/セットアップしているソフトウェアの棚卸しは、既定で `docker-context-checker-software.csv` にUTF-8 BOM付きCSVとして出力します。ベースイメージ、Javaバージョンの推定情報、パッケージマネージャで導入しているOSパッケージ、ダウンロード/展開しているアーカイブ、WildFly/JBoss設定、取り込んでいるJDBCドライバJARやjboss-cliのdriver設定を一覧化します。
@@ -107,7 +124,13 @@ JBoss EAP 8.1コンテナを実際に起動し、起動ログからサーバー�
 ```bash
 ./docker-context-checker.sh -c /path/to/context --eap-startup-probe
 ./docker-context-checker.sh -c /path/to/context --eap-startup-probe --eap-startup-timeout 240 --eap-startup-run-option "-e=APP_ENV=test"
+./docker-context-checker.sh -c /path/to/context --eap-startup-probe --eap-startup-from-base
+./docker-context-checker.sh -c /path/to/context --eap-startup-probe --eap-startup-run-image registry.example.com/eap-base:8.1 --eap-startup-command "/opt/eap/bin/standalone.sh -b 0.0.0.0"
 ```
+
+`--eap-startup-probe` は既定では Dockerfile を build したイメージを起動します。Dockerfileの final stage の `FROM` ベースイメージ自体を検証したい場合は `--eap-startup-from-base`、既に存在する任意のベースイメージや事前build済みイメージを起動したい場合は `--eap-startup-run-image IMAGE` を使います。ベースイメージに既定の `CMD` がなくJBoss EAPが自動起動しない場合は、`--eap-startup-command` で起動コマンドを渡せます。
+
+Docker実行系プローブでDocker socketの権限エラーになった場合は、`sudo -n docker ...` で一度だけ再試行します。sudoが失敗した場合は警告として記録し、CSVなどのレポート出力は継続します。
 
 ## 主なチェック
 

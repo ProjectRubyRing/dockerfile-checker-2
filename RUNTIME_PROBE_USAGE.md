@@ -4,6 +4,10 @@
 
 既定では無効です。Docker daemon を起動し、対象の Dockerfile がローカルで build できる状態のときだけ利用してください。
 
+Docker daemon socket の権限などで `permission denied` になった場合は、`sudo -n docker ...` で一度だけ再試行します。sudoが成功した場合はそのまま後続のDocker操作もsudo経由で続行します。sudoが使えない、またはパスワード入力が必要で失敗した場合は `RTP008` の警告を出して、他のレポート出力は継続します。
+
+Dockerを実際に起動するチェックだけの結果は、既定で `docker-context-checker-container-checks.csv` にも出力します。出力先は `--container-check-output FILE` で指定できます。
+
 ## 基本
 
 ```bash
@@ -51,6 +55,12 @@ Docker build/run による実行プローブを有効化します。
 
 `docker build` へ追加オプションを渡します。複数回指定できます。BuildKit build secrets、build args、network指定などが必要な Dockerfile で使います。
 
+```bash
+--container-check-output container-checks.csv
+```
+
+Docker実行プローブとJBoss EAP起動プローブの結果だけをExcelで取り込めるCSVとして出力します。
+
 ## 出力される主なコード
 
 | Code | Meaning |
@@ -66,6 +76,7 @@ Docker build/run による実行プローブを有効化します。
 | `RTP005` | `java -version` 実行プローブ成功 |
 | `RTP006` | `java -version` 実行プローブ失敗 |
 | `RTP007` | 一時イメージの自動削除に失敗 |
+| `RTP008` | Docker権限エラー後の `sudo -n docker` 再試行にも失敗 |
 
 ## 注意
 

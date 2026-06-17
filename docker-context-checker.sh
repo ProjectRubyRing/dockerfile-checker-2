@@ -17,6 +17,8 @@ REPORT_ENABLED=1
 REPORT_FILE=""
 MERMAID_ENABLED=1
 MERMAID_FILE=""
+ASCII_ART_ENABLED=1
+ASCII_ART_FILE=""
 VAR_REPORT_ENABLED=1
 VAR_REPORT_FILE=""
 SOFTWARE_REPORT_ENABLED=1
@@ -25,21 +27,36 @@ CONFIG_REPORT_ENABLED=1
 CONFIG_REPORT_FILE=""
 ECS_ENV_REPORT_ENABLED=1
 ECS_ENV_REPORT_FILE=""
+CONTAINER_CHECK_REPORT_ENABLED=1
+CONTAINER_CHECK_REPORT_FILE=""
 RUNTIME_PROBE_ENABLED=0
 RUNTIME_PROBE_IMAGE=""
 RUNTIME_PROBE_KEEP_IMAGE=0
 RUNTIME_PROBE_IMAGE_CUSTOM=0
+RUNTIME_PROBE_EFFECTIVE_IMAGE=""
 declare -a RUNTIME_PROBE_BUILD_OPTIONS=()
 EAP_STARTUP_PROBE_ENABLED=0
+EAP_STARTUP_TARGET="build"
 EAP_STARTUP_IMAGE=""
 EAP_STARTUP_IMAGE_CUSTOM=0
+EAP_STARTUP_RUN_IMAGE=""
 EAP_STARTUP_KEEP_IMAGE=0
 EAP_STARTUP_CONTAINER=""
 EAP_STARTUP_CONTAINER_CUSTOM=0
 EAP_STARTUP_KEEP_CONTAINER=0
 EAP_STARTUP_TIMEOUT=180
+EAP_STARTUP_COMMAND=""
+EAP_STARTUP_EFFECTIVE_IMAGE=""
+EAP_STARTUP_EFFECTIVE_CONTAINER=""
+EAP_STARTUP_EFFECTIVE_MODE=""
 declare -a EAP_STARTUP_BUILD_OPTIONS=()
 declare -a EAP_STARTUP_RUN_OPTIONS=()
+DOCKER_USE_SUDO=0
+DOCKER_CAPTURE_OUTPUT=""
+DOCKER_CAPTURE_RC=0
+DOCKER_CAPTURE_PERMISSION=0
+DOCKER_CAPTURE_SUDO_ATTEMPTED=0
+DOCKER_CAPTURE_SUDO_FAILED=0
 
 declare -a F_SEV=()
 declare -a F_PHASE=()
@@ -168,6 +185,8 @@ Options:
                            Default: ./docker-context-checker-results.csv.
       --mermaid FILE       Write build-context relationship diagram as Mermaid.
                            Default: ./docker-context-relations.mmd.
+      --ascii-art FILE     Write build-context relationship diagram as aligned
+                           ASCII art. Default: ./docker-context-relations.txt.
       --variables-output FILE
                            Write Dockerfile/shell variable inventory CSV.
                            Default: ./docker-context-checker-variables.csv.
@@ -179,6 +198,9 @@ Options:
       --ecs-env-output FILE
                            Write ECS task definition environment inventory CSV.
                            Default: ./docker-context-checker-ecs-env.csv.
+      --container-check-output FILE
+                           Write Docker runtime/EAP probe result CSV.
+                           Default: ./docker-context-checker-container-checks.csv.
       --runtime-probe      Build the Docker image and run ksh/java executable probes.
                            Disabled by default because it starts Docker.
       --runtime-probe-image TAG
@@ -191,12 +213,23 @@ Options:
                            Keep the temporary probe image after checks.
       --eap-startup-probe  Build and start the container, then inspect JBoss EAP
                            startup logs for server/deployment success.
+      --eap-startup-target MODE
+                           EAP probe target: build, from, or image. Default: build.
+                           build: build this Dockerfile, from: run final FROM image,
+                           image: run --eap-startup-run-image.
+      --eap-startup-from-base
+                           Shortcut for --eap-startup-target from.
       --eap-startup-timeout SEC
                            Seconds to wait for JBoss EAP startup logs. Default: 180.
       --eap-startup-image TAG
-                           Image tag to use for --eap-startup-probe.
+                           Image tag to build for --eap-startup-probe target=build.
+      --eap-startup-run-image IMAGE
+                           Existing image to run for --eap-startup-target image.
       --eap-startup-container NAME
                            Container name to use for --eap-startup-probe.
+      --eap-startup-command CMD
+                           Command string to run in the probe container via
+                           /bin/sh -lc CMD. Useful for base images without CMD.
       --eap-startup-build-option ARG
                            Extra docker build option for --eap-startup-probe.
                            Repeat for secrets, build args, network options, etc.
@@ -212,11 +245,14 @@ Options:
       --no-progress        Do not print phase-by-phase progress messages.
       --no-output          Do not write the CSV report file.
       --no-mermaid         Do not write the Mermaid relationship diagram.
+      --no-ascii-art       Do not write the ASCII relationship diagram.
       --no-variables-output
                            Do not write the variable inventory CSV.
       --no-software-output Do not write the software inventory CSV.
       --no-config-output   Do not write the Java/JBoss setting audit CSV.
       --no-ecs-env-output  Do not write the ECS environment inventory CSV.
+      --no-container-check-output
+                           Do not write the Docker runtime/EAP probe result CSV.
       --no-runtime-probe   Disable Docker runtime probes.
       --no-eap-startup-probe
                            Disable JBoss EAP startup probe.
@@ -236,6 +272,8 @@ Checks include:
     entrypoint shells, and WildFly/JBoss CLI expressions.
   - Optional Docker runtime probe for ksh and java executability.
   - Optional JBoss EAP 8.1 startup log probe and deployed WAR detection.
+  - Docker permission failures in probes retry once with sudo -n docker; if sudo
+    fails, the probe records a warning and the report generation continues.
   - WildFly jboss-cli --file / --commands detection, CLI file syntax heuristics,
     and JNDI setting validation.
   - UBI 9.6 final image consistency, especially runtime entrypoint behavior.
@@ -467,6 +505,71 @@ compact_output() {
     s="${s:0:700}..."
   fi
   printf '%s' "$s"
+}
+
+output_has_permission_error() {
+  grep -Eiq 'permission denied|access denied|operation not permitted|Got permission denied|dial unix .*permission|var/run/docker\.sock.*permission|docker_engine.*permission|open .*permission'
+}
+
+docker_capture() {
+  local output rc sudo_output sudo_rc
+  DOCKER_CAPTURE_OUTPUT=""
+  DOCKER_CAPTURE_RC=0
+  DOCKER_CAPTURE_PERMISSION=0
+  DOCKER_CAPTURE_SUDO_ATTEMPTED=0
+  DOCKER_CAPTURE_SUDO_FAILED=0
+
+  if (( DOCKER_USE_SUDO )); then
+    output="$(sudo -n docker "$@" 2>&1)"
+    rc=$?
+    if (( rc != 0 )) && printf '%s\n' "$output" | output_has_permission_error; then
+      DOCKER_CAPTURE_PERMISSION=1
+      DOCKER_CAPTURE_SUDO_ATTEMPTED=1
+      DOCKER_CAPTURE_SUDO_FAILED=1
+    fi
+    DOCKER_CAPTURE_OUTPUT="$output"
+    DOCKER_CAPTURE_RC="$rc"
+    return "$rc"
+  fi
+
+  output="$(docker "$@" 2>&1)"
+  rc=$?
+  if (( rc != 0 )) && printf '%s\n' "$output" | output_has_permission_error; then
+    DOCKER_CAPTURE_PERMISSION=1
+    DOCKER_CAPTURE_SUDO_ATTEMPTED=1
+    if command -v sudo >/dev/null 2>&1; then
+      progress_log "SUDO" "Docker command hit a permission error; retrying with sudo -n docker $*"
+      sudo_output="$(sudo -n docker "$@" 2>&1)"
+      sudo_rc=$?
+      if (( sudo_rc == 0 )); then
+        DOCKER_USE_SUDO=1
+        DOCKER_CAPTURE_OUTPUT="$sudo_output"
+        DOCKER_CAPTURE_RC=0
+        progress_log "SUDO" "sudo docker retry succeeded; continuing with sudo for later Docker commands"
+        return 0
+      fi
+      DOCKER_CAPTURE_SUDO_FAILED=1
+      DOCKER_CAPTURE_OUTPUT="$output"$'\n'"sudo retry failed: $sudo_output"
+      DOCKER_CAPTURE_RC="$sudo_rc"
+      return "$sudo_rc"
+    fi
+    DOCKER_CAPTURE_SUDO_FAILED=1
+    DOCKER_CAPTURE_OUTPUT="$output"$'\n'"sudo retry failed: sudo command was not found"
+    DOCKER_CAPTURE_RC="$rc"
+    return "$rc"
+  fi
+
+  DOCKER_CAPTURE_OUTPUT="$output"
+  DOCKER_CAPTURE_RC="$rc"
+  return "$rc"
+}
+
+docker_permission_sudo_failed() {
+  (( DOCKER_CAPTURE_PERMISSION && DOCKER_CAPTURE_SUDO_FAILED ))
+}
+
+docker_permission_warning_text() {
+  printf 'Docker command failed due to permissions. sudo retry was attempted but did not succeed; skipping this Docker-backed operation and continuing. Output: %s' "$(compact_output "$DOCKER_CAPTURE_OUTPUT")"
 }
 
 is_final_build_phase() {
@@ -1007,6 +1110,12 @@ parse_args() {
         MERMAID_ENABLED=1
         shift 2
         ;;
+      --ascii-art|--ascii)
+        [[ $# -ge 2 ]] || die "$1 requires a file"
+        ASCII_ART_FILE="$2"
+        ASCII_ART_ENABLED=1
+        shift 2
+        ;;
       --variables-output)
         [[ $# -ge 2 ]] || die "$1 requires a file"
         VAR_REPORT_FILE="$2"
@@ -1029,6 +1138,12 @@ parse_args() {
         [[ $# -ge 2 ]] || die "$1 requires a file"
         ECS_ENV_REPORT_FILE="$2"
         ECS_ENV_REPORT_ENABLED=1
+        shift 2
+        ;;
+      --container-check-output)
+        [[ $# -ge 2 ]] || die "$1 requires a file"
+        CONTAINER_CHECK_REPORT_FILE="$2"
+        CONTAINER_CHECK_REPORT_ENABLED=1
         shift 2
         ;;
       --runtime-probe)
@@ -1057,6 +1172,21 @@ parse_args() {
         EAP_STARTUP_PROBE_ENABLED=1
         shift
         ;;
+      --eap-startup-target)
+        [[ $# -ge 2 ]] || die "$1 requires build, from, or image"
+        EAP_STARTUP_TARGET="$(lower "$2")"
+        case "$EAP_STARTUP_TARGET" in
+          build|from|image) ;;
+          *) die "$1 requires build, from, or image" ;;
+        esac
+        EAP_STARTUP_PROBE_ENABLED=1
+        shift 2
+        ;;
+      --eap-startup-from-base)
+        EAP_STARTUP_TARGET="from"
+        EAP_STARTUP_PROBE_ENABLED=1
+        shift
+        ;;
       --eap-startup-timeout)
         [[ $# -ge 2 ]] || die "$1 requires seconds"
         [[ "$2" =~ ^[0-9]+$ ]] || die "$1 requires a positive integer"
@@ -1071,10 +1201,23 @@ parse_args() {
         EAP_STARTUP_PROBE_ENABLED=1
         shift 2
         ;;
+      --eap-startup-run-image|--eap-startup-existing-image)
+        [[ $# -ge 2 ]] || die "$1 requires an image name"
+        EAP_STARTUP_RUN_IMAGE="$2"
+        EAP_STARTUP_TARGET="image"
+        EAP_STARTUP_PROBE_ENABLED=1
+        shift 2
+        ;;
       --eap-startup-container)
         [[ $# -ge 2 ]] || die "$1 requires a container name"
         EAP_STARTUP_CONTAINER="$2"
         EAP_STARTUP_CONTAINER_CUSTOM=1
+        EAP_STARTUP_PROBE_ENABLED=1
+        shift 2
+        ;;
+      --eap-startup-command)
+        [[ $# -ge 2 ]] || die "$1 requires a command string"
+        EAP_STARTUP_COMMAND="$2"
         EAP_STARTUP_PROBE_ENABLED=1
         shift 2
         ;;
@@ -1125,6 +1268,10 @@ parse_args() {
         MERMAID_ENABLED=0
         shift
         ;;
+      --no-ascii-art|--no-ascii)
+        ASCII_ART_ENABLED=0
+        shift
+        ;;
       --no-variables-output)
         VAR_REPORT_ENABLED=0
         shift
@@ -1139,6 +1286,10 @@ parse_args() {
         ;;
       --no-ecs-env-output)
         ECS_ENV_REPORT_ENABLED=0
+        shift
+        ;;
+      --no-container-check-output)
+        CONTAINER_CHECK_REPORT_ENABLED=0
         shift
         ;;
       --no-runtime-probe)
@@ -3042,8 +3193,13 @@ scan_all_cli() {
 run_runtime_probe_command() {
   local image="$1" tool="$2" command="$3" output rc sev message
   progress_log "PROBE" "Running Docker runtime probe for $tool"
-  output="$(docker run --rm --entrypoint /bin/sh "$image" -c "$command" 2>&1)"
+  docker_capture run --rm --entrypoint /bin/sh "$image" -c "$command"
   rc=$?
+  output="$DOCKER_CAPTURE_OUTPUT"
+  if (( rc != 0 )) && docker_permission_sudo_failed; then
+    add_finding "WARN" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP008" "$(docker_permission_warning_text)"
+    return 0
+  fi
   output="$(compact_output "$output")"
   case "$tool" in
     ksh)
@@ -3079,20 +3235,30 @@ run_runtime_probe() {
     auto_image=1
   fi
   image="$RUNTIME_PROBE_IMAGE"
+  RUNTIME_PROBE_EFFECTIVE_IMAGE="$image"
 
   progress_log "PROBE" "Checking Docker CLI and daemon"
   if ! command -v docker >/dev/null 2>&1; then
     add_finding "ERROR" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP001" "Docker runtime probe was requested, but docker command was not found in PATH."
     return 0
   fi
-  if ! info_output="$(docker info 2>&1)"; then
+  if ! docker_capture info; then
+    info_output="$DOCKER_CAPTURE_OUTPUT"
+    if docker_permission_sudo_failed; then
+      add_finding "WARN" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP008" "$(docker_permission_warning_text)"
+      return 0
+    fi
     add_finding "ERROR" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP001" "Docker runtime probe was requested, but Docker daemon is not available. Output: $(compact_output "$info_output")"
     return 0
   fi
 
   progress_log "PROBE" "Building Docker image for runtime probe: $image"
-  build_output="$(docker build "${RUNTIME_PROBE_BUILD_OPTIONS[@]}" -f "$DOCKERFILE_PATH" -t "$image" "$CONTEXT_DIR" 2>&1)"
-  if (($? != 0)); then
+  if ! docker_capture build "${RUNTIME_PROBE_BUILD_OPTIONS[@]}" -f "$DOCKERFILE_PATH" -t "$image" "$CONTEXT_DIR"; then
+    build_output="$DOCKER_CAPTURE_OUTPUT"
+    if docker_permission_sudo_failed; then
+      add_finding "WARN" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP008" "$(docker_permission_warning_text)"
+      return 0
+    fi
     add_finding "ERROR" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP002" "Docker runtime probe image build failed. Output: $(compact_output "$build_output")"
     return 0
   fi
@@ -3102,7 +3268,12 @@ run_runtime_probe() {
 
   if (( ! RUNTIME_PROBE_KEEP_IMAGE && auto_image && ! RUNTIME_PROBE_IMAGE_CUSTOM )); then
     progress_log "PROBE" "Removing temporary runtime probe image: $image"
-    if ! cleanup_output="$(docker image rm "$image" 2>&1)"; then
+    if ! docker_capture image rm "$image"; then
+      cleanup_output="$DOCKER_CAPTURE_OUTPUT"
+      if docker_permission_sudo_failed; then
+        add_finding "WARN" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP008" "$(docker_permission_warning_text)"
+        return 0
+      fi
       add_finding "INFO" "runtime-probe" "$DOCKERFILE_PATH" "-" "RTP007" "Temporary runtime probe image could not be removed automatically. Output: $(compact_output "$cleanup_output")"
     fi
   fi
@@ -3142,43 +3313,119 @@ eap_log_has_eap81() {
   grep -Eqi 'JBoss EAP[^0-9]*8\.1|EAP[^0-9]*8\.1'
 }
 
+resolve_external_base_for_stage() {
+  local stage="$1" base base_l next guard=0
+  while (( stage >= 0 && stage <= FINAL_STAGE )); do
+    base="${STAGE_BASE[$stage]:-}"
+    [[ -z "$base" ]] && return 1
+    [[ "$base" == *'$'* || "$base" == *'${'* ]] && return 1
+
+    base_l="$(lower "$base")"
+    next="${STAGE_BY_NAME[$base_l]:-}"
+    if [[ -n "$next" && "$next" =~ ^[0-9]+$ && "$next" != "$stage" ]]; then
+      stage="$next"
+      guard=$((guard + 1))
+      (( guard <= FINAL_STAGE + 1 )) || return 1
+      continue
+    fi
+
+    printf '%s' "$base"
+    return 0
+  done
+  return 1
+}
+
 run_eap_startup_probe() {
   (( EAP_STARTUP_PROBE_ENABLED )) || return 0
   local image container build_output info_output run_output logs cleanup_output auto_image=0 auto_container=0
   local start deadline now startup_success=0 deploy_success=0 failure_seen=0 eap81_seen=0 exited=0 exit_status=""
-  local wars war_list startup_lines deploy_lines failure_lines
+  local wars war_list startup_lines deploy_lines failure_lines permission_probe_blocked=0
+  local -a run_cmd=()
 
-  if [[ -z "$EAP_STARTUP_IMAGE" ]]; then
-    EAP_STARTUP_IMAGE="docker-context-checker-eap-probe:$(date '+%Y%m%d%H%M%S')-$$"
-    auto_image=1
-  fi
+  case "$EAP_STARTUP_TARGET" in
+    build)
+      if [[ -z "$EAP_STARTUP_IMAGE" ]]; then
+        EAP_STARTUP_IMAGE="docker-context-checker-eap-probe:$(date '+%Y%m%d%H%M%S')-$$"
+        auto_image=1
+      fi
+      image="$EAP_STARTUP_IMAGE"
+      EAP_STARTUP_EFFECTIVE_MODE="build"
+      ;;
+    from)
+      if ! image="$(resolve_external_base_for_stage "$FINAL_STAGE")"; then
+        add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "${STAGE_LINE[$FINAL_STAGE]:-1}" "EAP014" "JBoss EAP startup probe target=from could not resolve a runnable external image from the final FROM instruction: ${FINAL_BASE:-unknown}."
+        return 0
+      fi
+      EAP_STARTUP_EFFECTIVE_MODE="from"
+      add_finding "INFO" "eap-startup-probe" "$DOCKERFILE_PATH" "${STAGE_LINE[$FINAL_STAGE]:-1}" "EAP015" "JBoss EAP startup probe will run the Dockerfile FROM base image directly; docker build is skipped. Image: $image"
+      ;;
+    image)
+      if [[ -z "$EAP_STARTUP_RUN_IMAGE" && -n "$EAP_STARTUP_IMAGE" ]]; then
+        EAP_STARTUP_RUN_IMAGE="$EAP_STARTUP_IMAGE"
+      fi
+      if [[ -z "$EAP_STARTUP_RUN_IMAGE" ]]; then
+        add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP014" "JBoss EAP startup probe target=image requires --eap-startup-run-image IMAGE."
+        return 0
+      fi
+      image="$EAP_STARTUP_RUN_IMAGE"
+      EAP_STARTUP_EFFECTIVE_MODE="image"
+      add_finding "INFO" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP015" "JBoss EAP startup probe will run an existing image directly; docker build is skipped. Image: $image"
+      ;;
+    *)
+      add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP014" "Unsupported JBoss EAP startup probe target mode: $EAP_STARTUP_TARGET."
+      return 0
+      ;;
+  esac
+
   if [[ -z "$EAP_STARTUP_CONTAINER" ]]; then
     EAP_STARTUP_CONTAINER="docker-context-checker-eap-probe-$(date '+%Y%m%d%H%M%S')-$$"
     auto_container=1
   fi
-  image="$EAP_STARTUP_IMAGE"
   container="$EAP_STARTUP_CONTAINER"
+  EAP_STARTUP_EFFECTIVE_IMAGE="$image"
+  EAP_STARTUP_EFFECTIVE_CONTAINER="$container"
 
   progress_log "EAP-PROBE" "Checking Docker CLI and daemon"
   if ! command -v docker >/dev/null 2>&1; then
     add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP001" "JBoss EAP startup probe was requested, but docker command was not found in PATH."
     return 0
   fi
-  if ! info_output="$(docker info 2>&1)"; then
+  if ! docker_capture info; then
+    info_output="$DOCKER_CAPTURE_OUTPUT"
+    if docker_permission_sudo_failed; then
+      add_finding "WARN" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP013" "$(docker_permission_warning_text)"
+      return 0
+    fi
     add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP001" "JBoss EAP startup probe was requested, but Docker daemon is not available. Output: $(compact_output "$info_output")"
     return 0
   fi
 
-  progress_log "EAP-PROBE" "Building Docker image for JBoss EAP startup probe: $image"
-  build_output="$(docker build "${EAP_STARTUP_BUILD_OPTIONS[@]}" -f "$DOCKERFILE_PATH" -t "$image" "$CONTEXT_DIR" 2>&1)"
-  if (($? != 0)); then
-    add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP002" "JBoss EAP startup probe image build failed. Output: $(compact_output "$build_output")"
-    return 0
+  if [[ "$EAP_STARTUP_EFFECTIVE_MODE" == "build" ]]; then
+    progress_log "EAP-PROBE" "Building Docker image for JBoss EAP startup probe: $image"
+    if ! docker_capture build "${EAP_STARTUP_BUILD_OPTIONS[@]}" -f "$DOCKERFILE_PATH" -t "$image" "$CONTEXT_DIR"; then
+      build_output="$DOCKER_CAPTURE_OUTPUT"
+      if docker_permission_sudo_failed; then
+        add_finding "WARN" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP013" "$(docker_permission_warning_text)"
+        return 0
+      fi
+      add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP002" "JBoss EAP startup probe image build failed. Output: $(compact_output "$build_output")"
+      return 0
+    fi
+  else
+    progress_log "EAP-PROBE" "Skipping docker build; using $EAP_STARTUP_EFFECTIVE_MODE image for JBoss EAP startup probe: $image"
   fi
 
   progress_log "EAP-PROBE" "Starting container for JBoss EAP log probe: $container"
-  run_output="$(docker run -d --name "$container" "${EAP_STARTUP_RUN_OPTIONS[@]}" "$image" 2>&1)"
-  if (($? != 0)); then
+  run_cmd=(run -d --name "$container" "${EAP_STARTUP_RUN_OPTIONS[@]}" "$image")
+  if [[ -n "$EAP_STARTUP_COMMAND" ]]; then
+    run_cmd+=("/bin/sh" "-lc" "$EAP_STARTUP_COMMAND")
+  fi
+  if ! docker_capture "${run_cmd[@]}"; then
+    run_output="$DOCKER_CAPTURE_OUTPUT"
+    if docker_permission_sudo_failed; then
+      add_finding "WARN" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP013" "$(docker_permission_warning_text)"
+      return 0
+    fi
     add_finding "ERROR" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP003" "JBoss EAP startup probe container could not be started. Output: $(compact_output "$run_output")"
     return 0
   fi
@@ -3187,7 +3434,16 @@ run_eap_startup_probe() {
   deadline=$((start + EAP_STARTUP_TIMEOUT))
   logs=""
   while :; do
-    logs="$(docker logs "$container" 2>&1 || true)"
+    if docker_capture logs "$container"; then
+      logs="$DOCKER_CAPTURE_OUTPUT"
+    else
+      logs="$DOCKER_CAPTURE_OUTPUT"
+      if docker_permission_sudo_failed; then
+        add_finding "WARN" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP013" "$(docker_permission_warning_text)"
+        permission_probe_blocked=1
+        break
+      fi
+    fi
     if printf '%s\n' "$logs" | eap_log_has_startup_success; then
       startup_success=1
     fi
@@ -3203,7 +3459,16 @@ run_eap_startup_probe() {
     if (( startup_success && deploy_success )); then
       break
     fi
-    exit_status="$(docker inspect -f '{{.State.Status}}:{{.State.ExitCode}}' "$container" 2>/dev/null || true)"
+    if docker_capture inspect -f '{{.State.Status}}:{{.State.ExitCode}}' "$container"; then
+      exit_status="$DOCKER_CAPTURE_OUTPUT"
+    else
+      exit_status=""
+      if docker_permission_sudo_failed; then
+        add_finding "WARN" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP013" "$(docker_permission_warning_text)"
+        permission_probe_blocked=1
+        break
+      fi
+    fi
     if [[ "$exit_status" == exited:* || "$exit_status" == dead:* ]]; then
       exited=1
       break
@@ -3226,7 +3491,9 @@ run_eap_startup_probe() {
     done < <(printf '%s\n' "$logs" | extract_eap_deployed_wars)
   fi
 
-  if (( startup_success && deploy_success )); then
+  if (( permission_probe_blocked )); then
+    :
+  elif (( startup_success && deploy_success )); then
     add_finding "INFO" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP004" "JBoss EAP startup probe succeeded: startup success and WAR deployment success logs were found. WARs: ${war_list:-'(none parsed)'}. Startup log: $(compact_output "$startup_lines") Deployment log: $(compact_output "$deploy_lines")"
     if (( ! eap81_seen )); then
       add_finding "WARN" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP012" "JBoss EAP startup succeeded, but the logs did not clearly identify JBoss EAP 8.1. Verify the image version. Startup log: $(compact_output "$startup_lines")"
@@ -3251,13 +3518,21 @@ run_eap_startup_probe() {
 
   if (( ! EAP_STARTUP_KEEP_CONTAINER && auto_container && ! EAP_STARTUP_CONTAINER_CUSTOM )); then
     progress_log "EAP-PROBE" "Removing JBoss EAP startup probe container: $container"
-    if ! cleanup_output="$(docker rm -f "$container" 2>&1)"; then
+    if ! docker_capture rm -f "$container"; then
+      cleanup_output="$DOCKER_CAPTURE_OUTPUT"
+      if docker_permission_sudo_failed; then
+        add_finding "WARN" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP013" "$(docker_permission_warning_text)"
+      fi
       add_finding "INFO" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP011" "Temporary JBoss EAP probe container could not be removed automatically. Output: $(compact_output "$cleanup_output")"
     fi
   fi
-  if (( ! EAP_STARTUP_KEEP_IMAGE && auto_image && ! EAP_STARTUP_IMAGE_CUSTOM )); then
+  if [[ "$EAP_STARTUP_EFFECTIVE_MODE" == "build" ]] && (( ! EAP_STARTUP_KEEP_IMAGE && auto_image && ! EAP_STARTUP_IMAGE_CUSTOM )); then
     progress_log "EAP-PROBE" "Removing JBoss EAP startup probe image: $image"
-    if ! cleanup_output="$(docker image rm "$image" 2>&1)"; then
+    if ! docker_capture image rm "$image"; then
+      cleanup_output="$DOCKER_CAPTURE_OUTPUT"
+      if docker_permission_sudo_failed; then
+        add_finding "WARN" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP013" "$(docker_permission_warning_text)"
+      fi
       add_finding "INFO" "eap-startup-probe" "$DOCKERFILE_PATH" "-" "EAP011" "Temporary JBoss EAP probe image could not be removed automatically. Output: $(compact_output "$cleanup_output")"
     fi
   fi
@@ -3349,6 +3624,7 @@ suggestion_for_code() {
     RTP004) printf 'Install ksh in the final image, verify PATH and /bin/sh availability, then rerun --runtime-probe.' ;;
     RTP006) printf 'Install a Java runtime/JDK in the final image, verify PATH/JAVA_HOME, then rerun --runtime-probe.' ;;
     RTP007) printf 'Remove the temporary probe image manually with docker image rm if it is no longer needed.' ;;
+    RTP008) printf 'Docker permission error could not be solved by sudo -n. Add the user to the docker group, configure passwordless sudo for docker, or run the checker with appropriate privileges.' ;;
     EAP001) printf 'Install Docker CLI and ensure the Docker daemon is running before using --eap-startup-probe.' ;;
     EAP002) printf 'Fix the Docker build failure first. If the Dockerfile needs secrets or build args, pass them with repeated --eap-startup-build-option arguments.' ;;
     EAP003) printf 'Fix container startup options, required environment variables, volumes, ports, or entrypoint permissions, then rerun --eap-startup-probe.' ;;
@@ -3361,6 +3637,9 @@ suggestion_for_code() {
     EAP010) printf 'Detected WAR file names are informational; verify they match the application artifacts intended for this image.' ;;
     EAP011) printf 'Remove the temporary probe image or container manually with docker rm/docker image rm if it is no longer needed.' ;;
     EAP012) printf 'Verify the runtime image really contains JBoss EAP 8.1; the startup log did not clearly prove that version.' ;;
+    EAP013) printf 'Docker permission error could not be solved by sudo -n. Add the user to the docker group, configure passwordless sudo for docker, or run the checker with appropriate privileges.' ;;
+    EAP014) printf 'Select a runnable EAP probe target: use --eap-startup-target build, --eap-startup-from-base when the final FROM resolves to an external image, or --eap-startup-run-image IMAGE for a prebuilt image.' ;;
+    EAP015) printf 'The probe is intentionally running an existing/base image and skipping docker build. Use --eap-startup-command if the image has no default CMD that starts JBoss EAP.' ;;
     UBI001|UBI002) printf 'RHEL/UBI 9.6前提ならベースイメージタグを9.6に固定してください。' ;;
     UBI003|UBI004) printf 'UBI minimalではmicrodnf利用とキャッシュ削除を確認してください。パッケージ導入はDockerfileビルド時に寄せるのが基本です。' ;;
     UBI005|UBI012) printf 'subscription-managerに依存しない構成へ見直してください。UBIコンテナはホスト購読状態へ依存させない方が移植性があります。' ;;
@@ -3566,6 +3845,77 @@ write_mermaid_file() {
   } > "$MERMAID_FILE"
 }
 
+ascii_clean() {
+  local s="$1"
+  s="${s//$'\r'/ }"
+  s="${s//$'\n'/ }"
+  s="${s//$'\t'/ }"
+  printf '%s' "$s"
+}
+
+write_ascii_art_file() {
+  (( ASCII_ART_ENABLED )) || return 0
+  local dir i from to label source_file source_line phase total seen connector detail_prefix
+  declare -A from_seen=()
+  declare -a from_order=()
+
+  dir="$(dirname -- "$ASCII_ART_FILE")"
+  mkdir -p -- "$dir"
+  progress_log "OUTPUT" "Writing ASCII relationship diagram: $ASCII_ART_FILE"
+
+  for ((i=0; i<${#REL_FROM[@]}; i++)); do
+    from="${REL_FROM[$i]}"
+    if [[ -z "${from_seen[$from]:-}" ]]; then
+      from_seen["$from"]=1
+      from_order+=("$from")
+    fi
+  done
+
+  {
+    printf 'Docker Context Relationship Diagram (ASCII)\n'
+    printf 'Context    : %s\n' "$(ascii_clean "$CONTEXT_DIR")"
+    printf 'Dockerfile : %s\n' "$(ascii_clean "$DOCKERFILE_PATH")"
+    printf 'Legend     : source --[reason]--> target\n'
+    printf '\n'
+
+    if (( ${#REL_FROM[@]} == 0 )); then
+      printf 'Dockerfile\n'
+      printf '`-- No build-context file relation was detected\n'
+      return 0
+    fi
+
+    for from in "${from_order[@]}"; do
+      total=0
+      for ((i=0; i<${#REL_FROM[@]}; i++)); do
+        [[ "${REL_FROM[$i]}" == "$from" ]] || continue
+        total=$((total + 1))
+      done
+
+      printf '%s\n' "$(ascii_clean "$from")"
+      seen=0
+      for ((i=0; i<${#REL_FROM[@]}; i++)); do
+        [[ "${REL_FROM[$i]}" == "$from" ]] || continue
+        seen=$((seen + 1))
+        to="$(ascii_clean "${REL_TO[$i]}")"
+        label="$(ascii_clean "${REL_LABEL[$i]}")"
+        phase="$(ascii_clean "${REL_PHASE[$i]}")"
+        source_file="$(ascii_clean "$(display_path "${REL_FILE[$i]}")")"
+        source_line="$(ascii_clean "${REL_LINE[$i]}")"
+        if (( seen == total )); then
+          connector='`--'
+          detail_prefix='    '
+        else
+          connector='|--'
+          detail_prefix='|   '
+        fi
+        printf '%s [%s] --> %s\n' "$connector" "$label" "$to"
+        printf '%sphase: %s, location: %s:%s\n' "$detail_prefix" "$phase" "$source_file" "$source_line"
+      done
+      printf '\n'
+    done
+  } > "$ASCII_ART_FILE"
+}
+
 write_variable_report_file() {
   (( VAR_REPORT_ENABLED )) || return 0
   local dir i file value note category action
@@ -3670,6 +4020,71 @@ write_ecs_env_report_file() {
   done
 }
 
+container_check_probe_name() {
+  case "$1" in
+    runtime-probe) printf 'runtime executable probe' ;;
+    eap-startup-probe) printf 'JBoss EAP startup probe' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+container_check_target_mode() {
+  case "$1" in
+    runtime-probe) printf 'build' ;;
+    eap-startup-probe) printf '%s' "${EAP_STARTUP_EFFECTIVE_MODE:-$EAP_STARTUP_TARGET}" ;;
+    *) printf '-' ;;
+  esac
+}
+
+container_check_target_image() {
+  case "$1" in
+    runtime-probe) printf '%s' "${RUNTIME_PROBE_EFFECTIVE_IMAGE:-${RUNTIME_PROBE_IMAGE:-auto}}" ;;
+    eap-startup-probe) printf '%s' "${EAP_STARTUP_EFFECTIVE_IMAGE:-${EAP_STARTUP_RUN_IMAGE:-${EAP_STARTUP_IMAGE:-auto}}}" ;;
+    *) printf '-' ;;
+  esac
+}
+
+container_check_container_name() {
+  case "$1" in
+    eap-startup-probe) printf '%s' "${EAP_STARTUP_EFFECTIVE_CONTAINER:-${EAP_STARTUP_CONTAINER:-auto}}" ;;
+    *) printf '-' ;;
+  esac
+}
+
+write_container_check_report_file() {
+  (( CONTAINER_CHECK_REPORT_ENABLED )) || return 0
+  local dir i file line sev code result suggestion phase serial=1 found=0
+  dir="$(dirname -- "$CONTAINER_CHECK_REPORT_FILE")"
+  mkdir -p -- "$dir"
+  progress_log "OUTPUT" "Writing Excel container runtime check CSV: $CONTAINER_CHECK_REPORT_FILE"
+  printf '\xEF\xBB\xBF' > "$CONTAINER_CHECK_REPORT_FILE"
+  write_csv_row_to_file "$CONTAINER_CHECK_REPORT_FILE" \
+    "No" "Probe" "TargetMode" "TargetImage" "ContainerName" "Result" "Severity" "CheckCode" "File" "Line" "Message" "Suggestion"
+
+  for ((i=0; i<${#F_SEV[@]}; i++)); do
+    phase="${F_PHASE[$i]}"
+    case "$phase" in
+      runtime-probe|eap-startup-probe) ;;
+      *) continue ;;
+    esac
+    found=1
+    sev="${F_SEV[$i]}"
+    code="${F_CODE[$i]}"
+    result="$(result_label_for_severity "$sev")"
+    file="$(display_path "${F_FILE[$i]}")"
+    line="${F_LINE[$i]}"
+    suggestion="$(suggestion_for_code "$code")"
+    write_csv_row_to_file "$CONTAINER_CHECK_REPORT_FILE" \
+      "$serial" "$(container_check_probe_name "$phase")" "$(container_check_target_mode "$phase")" "$(container_check_target_image "$phase")" "$(container_check_container_name "$phase")" "$result" "$sev" "$code" "$file" "$line" "${F_MSG[$i]}" "$suggestion"
+    serial=$((serial + 1))
+  done
+
+  if (( ! found )); then
+    write_csv_row_to_file "$CONTAINER_CHECK_REPORT_FILE" \
+      "1" "-" "-" "-" "-" "情報" "INFO" "NO_CONTAINER_CHECKS" "-" "-" "No Docker runtime or JBoss EAP startup probe results were recorded. Enable --runtime-probe or --eap-startup-probe to populate this report." "必要な場合は --runtime-probe または --eap-startup-probe を指定してください。"
+  fi
+}
+
 print_header() {
   local stages stage_label
   stages=$((FINAL_STAGE + 1))
@@ -3697,6 +4112,9 @@ print_header() {
   if (( MERMAID_ENABLED )); then
     printf 'Mermaid    : %s\n' "$MERMAID_FILE"
   fi
+  if (( ASCII_ART_ENABLED )); then
+    printf 'ASCII art  : %s\n' "$ASCII_ART_FILE"
+  fi
   if (( VAR_REPORT_ENABLED )); then
     printf 'Variables  : %s\n' "$VAR_REPORT_FILE"
   fi
@@ -3709,11 +4127,14 @@ print_header() {
   if (( ECS_ENV_REPORT_ENABLED )); then
     printf 'ECS env    : %s\n' "$ECS_ENV_REPORT_FILE"
   fi
+  if (( CONTAINER_CHECK_REPORT_ENABLED )); then
+    printf 'Container  : %s\n' "$CONTAINER_CHECK_REPORT_FILE"
+  fi
   if (( RUNTIME_PROBE_ENABLED )); then
     printf 'Docker run : runtime probe enabled, image=%s\n' "${RUNTIME_PROBE_IMAGE:-auto}"
   fi
   if (( EAP_STARTUP_PROBE_ENABLED )); then
-    printf 'EAP probe  : enabled, image=%s, timeout=%ss\n' "${EAP_STARTUP_IMAGE:-auto}" "$EAP_STARTUP_TIMEOUT"
+    printf 'EAP probe  : enabled, target=%s, image=%s, timeout=%ss\n' "$EAP_STARTUP_TARGET" "${EAP_STARTUP_RUN_IMAGE:-${EAP_STARTUP_IMAGE:-auto}}" "$EAP_STARTUP_TIMEOUT"
   fi
   printf '\n'
 }
@@ -3762,6 +4183,10 @@ main() {
     [[ -z "$MERMAID_FILE" ]] && MERMAID_FILE="$PWD/docker-context-relations.mmd"
     MERMAID_FILE="$(abs_path "$MERMAID_FILE")"
   fi
+  if (( ASCII_ART_ENABLED )); then
+    [[ -z "$ASCII_ART_FILE" ]] && ASCII_ART_FILE="$PWD/docker-context-relations.txt"
+    ASCII_ART_FILE="$(abs_path "$ASCII_ART_FILE")"
+  fi
   if (( VAR_REPORT_ENABLED )); then
     [[ -z "$VAR_REPORT_FILE" ]] && VAR_REPORT_FILE="$PWD/docker-context-checker-variables.csv"
     VAR_REPORT_FILE="$(abs_path "$VAR_REPORT_FILE")"
@@ -3777,6 +4202,10 @@ main() {
   if (( ECS_ENV_REPORT_ENABLED )); then
     [[ -z "$ECS_ENV_REPORT_FILE" ]] && ECS_ENV_REPORT_FILE="$PWD/docker-context-checker-ecs-env.csv"
     ECS_ENV_REPORT_FILE="$(abs_path "$ECS_ENV_REPORT_FILE")"
+  fi
+  if (( CONTAINER_CHECK_REPORT_ENABLED )); then
+    [[ -z "$CONTAINER_CHECK_REPORT_FILE" ]] && CONTAINER_CHECK_REPORT_FILE="$PWD/docker-context-checker-container-checks.csv"
+    CONTAINER_CHECK_REPORT_FILE="$(abs_path "$CONTAINER_CHECK_REPORT_FILE")"
   fi
 
   progress_log "START" "Context=$CONTEXT_DIR Dockerfile=$DOCKERFILE_PATH"
@@ -3802,10 +4231,12 @@ main() {
   progress_log "DONE" "Checks completed"
   write_report_file
   write_mermaid_file
+  write_ascii_art_file
   write_variable_report_file
   write_software_report_file
   write_config_report_file
   write_ecs_env_report_file
+  write_container_check_report_file
   print_report
 
   case "$FAIL_ON" in

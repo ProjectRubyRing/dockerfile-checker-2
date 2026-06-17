@@ -4,6 +4,8 @@
 
 既定では無効です。Docker daemon を起動し、対象の Dockerfile がローカルで build でき、コンテナ起動に必要な環境変数やSecretを指定できる状態で利用してください。
 
+Docker daemon socket の権限などで `permission denied` になった場合は、`sudo -n docker ...` で一度だけ再試行します。sudoが成功した場合はそのまま後続のDocker操作もsudo経由で続行します。sudoが使えない、またはパスワード入力が必要で失敗した場合は `EAP013` の警告を出して、他のレポート出力は継続します。
+
 ## 基本
 
 ```bash
@@ -99,6 +101,9 @@ JBoss EAP 起動プローブを無効化します。既定でも無効ですが�
 | `EAP010` | ログからデプロイ済みWARファイル名を検出 |
 | `EAP011` | 一時イメージまたは一時コンテナの自動削除に失敗 |
 | `EAP012` | 起動成功は確認したが、ログ上でJBoss EAP 8.1を明確に確認できない |
+| `EAP013` | Docker権限エラー後の `sudo -n docker` 再試行にも失敗 |
+| `EAP014` | `--eap-startup-target from/image` の起動対象イメージを解決できない |
+| `EAP015` | buildをスキップしてFROMベースイメージまたは既存イメージを直接起動 |
 
 ## 注意
 
@@ -107,3 +112,34 @@ JBoss EAP 起動プローブを無効化します。既定でも無効ですが�
 - Dockerfile が build secrets を必須にしている場合は、`--eap-startup-build-option "--secret=..."` を指定してください。
 - 起動が遅いイメージでは `--eap-startup-timeout` を増やしてください。ただし、ログが停止している場合はタイムアウト延長より起動エラーの修正が先です。
 - この機能はログパターンによる判定です。EAPのログ形式を大きく変更している場合は、検出できない可能性があります。
+
+## FROMベースイメージ/既存イメージを直接起動する場合
+
+既定の `--eap-startup-probe` は Dockerfile を `docker build` したイメージを起動します。Dockerfile の final stage の `FROM` に書かれているベースイメージ自体を起動して確認したい場合は、次のように指定します。
+
+```bash
+./docker-context-checker.sh -c /path/to/context --eap-startup-probe --eap-startup-from-base
+```
+
+任意の既存イメージ、または事前に build したベースコンテナを起動したい場合は、`--eap-startup-run-image` を指定します。
+
+```bash
+./docker-context-checker.sh -c /path/to/context \
+  --eap-startup-probe \
+  --eap-startup-run-image registry.example.com/eap-base:8.1
+```
+
+ベースイメージに既定の `CMD` がなく、そのまま `docker run IMAGE` しても JBoss EAP が起動しない場合は、`--eap-startup-command` で起動コマンドを指定できます。このコマンドは `/bin/sh -lc` 経由で実行します。
+
+```bash
+./docker-context-checker.sh -c /path/to/context \
+  --eap-startup-probe \
+  --eap-startup-run-image registry.example.com/eap-base:8.1 \
+  --eap-startup-command "/opt/eap/bin/standalone.sh -b 0.0.0.0"
+```
+
+Dockerを実際に起動するチェックだけの結果は、既定で `docker-context-checker-container-checks.csv` にも出力します。出力先は次のオプションで指定できます。
+
+```bash
+--container-check-output eap-container-checks.csv
+```
