@@ -86,6 +86,20 @@ Dockerを実際に起動する `--runtime-probe` と `--eap-startup-probe` の�
 No, Probe, TargetMode, TargetImage, ContainerName, Result, Severity, CheckCode, File, Line, Message, Suggestion
 ```
 
+Dockerfile、シェル、JBoss CLIのdatasource設定からAurora MySQL接続候補を検出し、`SELECT 1` などの簡易クエリで疎通確認したい場合は、既定では無効のDBプローブを明示的に有効化します。結果は `docker-context-checker-db-checks.csv` にUTF-8 BOM付きCSVとして出力します。詳細は [DB_PROBE_USAGE.md](DB_PROBE_USAGE.md) を参照してください。
+
+```bash
+./docker-context-checker.sh -c /path/to/context --db-probe
+./docker-context-checker.sh -c /path/to/context --db-probe --db-check-output db-checks.csv
+./docker-context-checker.sh -c /path/to/context --db-probe --db-probe-query "SELECT 1"
+```
+
+DB接続チェックCSV列:
+
+```text
+No, Scope, Source, File, Line, JdbcUrl, Host, Port, Database, User, PasswordStatus, AuroraMySQLAssessment, ProbeQuery, Result, Severity, Message, Suggestion
+```
+
 Dockerfileやシェルスクリプトでインストール/セットアップしているソフトウェアの棚卸しは、既定で `docker-context-checker-software.csv` にUTF-8 BOM付きCSVとして出力します。ベースイメージ、Javaバージョンの推定情報、パッケージマネージャで導入しているOSパッケージ、ダウンロード/展開しているアーカイブ、WildFly/JBoss設定、取り込んでいるJDBCドライバJARやjboss-cliのdriver設定を一覧化します。
 
 ```bash
@@ -139,6 +153,7 @@ Docker実行系プローブでDocker socketの権限エラーになった場合�
 - `RUN --mount=type=secret` のBuildKit build secrets構文、`id=`、`target=`/`env=`、`required=true` などの検出とチェック
 - Dockerfile final stageでのkshセットアップ状況と、任意のDocker実行プローブによるksh/java実行確認
 - 任意のDocker起動プローブによるJBoss EAP 8.1起動成功ログ、WARデプロイ成功ログ、デプロイWAR名の確認
+- 任意のAurora MySQL DB接続プローブによる `SELECT 1` 疎通確認
 - ビルドコンテキスト内シンボリックリンクの破損やコンテキスト外参照
 - `RUN ln -s` はビルドフェーズ、entrypoint や呼び出しシェル内の `ln -s` は実行フェーズとして表示
 - entrypoint と呼び出し先シェルの変数チェック

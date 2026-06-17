@@ -29,6 +29,15 @@ ECS_ENV_REPORT_ENABLED=1
 ECS_ENV_REPORT_FILE=""
 CONTAINER_CHECK_REPORT_ENABLED=1
 CONTAINER_CHECK_REPORT_FILE=""
+DB_CHECK_REPORT_ENABLED=1
+DB_CHECK_REPORT_FILE=""
+DB_PROBE_ENABLED=0
+DB_PROBE_TIMEOUT=10
+DB_PROBE_QUERY="SELECT 1"
+DB_PROBE_CLIENT=""
+DB_PROBE_OUTPUT=""
+DB_PROBE_RC=0
+declare -a DB_PROBE_CLIENT_OPTIONS=()
 RUNTIME_PROBE_ENABLED=0
 RUNTIME_PROBE_IMAGE=""
 RUNTIME_PROBE_KEEP_IMAGE=0
@@ -150,6 +159,33 @@ declare -a ECS_ENV_REASON=()
 declare -a ECS_ENV_EVIDENCE=()
 declare -A ECS_ENV_SEEN=()
 
+declare -A DB_SCOPE_SEEN=()
+declare -a DB_SCOPE_ORDER=()
+declare -A DB_VALUE=()
+declare -A DB_FILE=()
+declare -A DB_LINE=()
+declare -A DB_PHASE=()
+declare -A DB_SOURCE=()
+declare -A DB_EVIDENCE=()
+declare -A DB_ENV_VALUE=()
+
+declare -a DB_CHECK_SCOPE=()
+declare -a DB_CHECK_SOURCE=()
+declare -a DB_CHECK_FILE=()
+declare -a DB_CHECK_LINE=()
+declare -a DB_CHECK_URL=()
+declare -a DB_CHECK_HOST=()
+declare -a DB_CHECK_PORT=()
+declare -a DB_CHECK_DATABASE=()
+declare -a DB_CHECK_USER=()
+declare -a DB_CHECK_PASSWORD_STATUS=()
+declare -a DB_CHECK_AURORA=()
+declare -a DB_CHECK_QUERY=()
+declare -a DB_CHECK_RESULT=()
+declare -a DB_CHECK_SEVERITY=()
+declare -a DB_CHECK_MESSAGE=()
+declare -a DB_CHECK_SUGGESTION=()
+
 FINAL_STAGE=-1
 FINAL_BASE=""
 FINAL_WORKDIR="/"
@@ -201,6 +237,20 @@ Options:
       --container-check-output FILE
                            Write Docker runtime/EAP probe result CSV.
                            Default: ./docker-context-checker-container-checks.csv.
+      --db-check-output FILE
+                           Write Aurora MySQL DB connectivity check CSV.
+                           Default: ./docker-context-checker-db-checks.csv.
+      --db-probe, --aurora-mysql-probe
+                           Run Aurora MySQL connectivity probe using detected DB
+                           connection settings. Disabled by default.
+      --db-probe-timeout SEC
+                           Seconds for each DB connection attempt. Default: 10.
+      --db-probe-query SQL
+                           SQL to run for DB probe. Default: SELECT 1.
+      --db-probe-client CMD
+                           mysql/mariadb client command. Default: auto-detect.
+      --db-probe-client-option ARG
+                           Extra mysql/mariadb client option. Repeatable.
       --runtime-probe      Build the Docker image and run ksh/java executable probes.
                            Disabled by default because it starts Docker.
       --runtime-probe-image TAG
@@ -253,6 +303,8 @@ Options:
       --no-ecs-env-output  Do not write the ECS environment inventory CSV.
       --no-container-check-output
                            Do not write the Docker runtime/EAP probe result CSV.
+      --no-db-check-output Do not write the DB connectivity check CSV.
+      --no-db-probe        Disable DB connectivity probe.
       --no-runtime-probe   Disable Docker runtime probes.
       --no-eap-startup-probe
                            Disable JBoss EAP startup probe.
@@ -272,6 +324,8 @@ Checks include:
     entrypoint shells, and WildFly/JBoss CLI expressions.
   - Optional Docker runtime probe for ksh and java executability.
   - Optional JBoss EAP 8.1 startup log probe and deployed WAR detection.
+  - Optional Aurora MySQL connectivity probe from Dockerfile, shell, and
+    WildFly/JBoss datasource settings.
   - Docker permission failures in probes retry once with sudo -n docker; if sudo
     fails, the probe records a warning and the report generation continues.
   - WildFly jboss-cli --file / --commands detection, CLI file syntax heuristics,
@@ -494,6 +548,139 @@ add_ecs_env_record() {
   ECS_ENV_EVIDENCE+=("$evidence")
 }
 
+db_setting_key_for_var() {
+  local name="$1" lname
+  lname="$(lower "$name")"
+  case "$lname" in
+    *jdbc*url*|*database_url*|*db_url*|*connection_url*|*datasource_url*|*aurora_url*|*mysql_url*|rds_url)
+      printf 'url' ;;
+    *hostname*|*host*|*endpoint*|rds_hostname)
+      printf 'host' ;;
+    *port*|rds_port)
+      printf 'port' ;;
+    *db_name*|*database_name*|*dbname*|*schema*|mysql_database|rds_db_name)
+      printf 'database' ;;
+    *username*|*user*|mysql_user|rds_username)
+      printf 'user' ;;
+    *password*|*passwd*|*pwd*|*pass*|mysql_password|rds_password)
+      printf 'password' ;;
+    *)
+      printf '' ;;
+  esac
+}
+
+db_scope_for_var() {
+  local name="$1" lname prefix suffix
+  lname="$(lower "$name")"
+  case "$lname" in
+    rds_*|aws_rds_*) printf 'env:rds'; return 0 ;;
+    mysql_*) printf 'env:mysql'; return 0 ;;
+    db_*|database_*) printf 'env:db'; return 0 ;;
+  esac
+  for suffix in \
+    _jdbc_url _database_url _db_url _connection_url _datasource_url _aurora_url _mysql_url \
+    _db_host _database_host _mysql_host _hostname _host _endpoint \
+    _db_port _database_port _mysql_port _port \
+    _db_name _database_name _dbname _schema \
+    _db_user _database_user _db_username _database_username _mysql_user _user _username \
+    _db_password _database_password _db_pass _password _passwd _pwd _pass; do
+    if [[ "$lname" == *"$suffix" ]]; then
+      prefix="${lname%"$suffix"}"
+      [[ -n "$prefix" ]] && { printf 'env:%s' "$prefix"; return 0; }
+    fi
+  done
+  printf 'env:default'
+}
+
+add_db_setting_record() {
+  local scope="$1" key="$2" value="$3" file="$4" line="$5" phase="$6" source="$7" evidence="$8"
+  local map_key
+  [[ -z "$scope" || -z "$key" ]] && return 0
+  [[ -z "$line" || "$line" == "0" ]] && line="-"
+  if [[ -z "${DB_SCOPE_SEEN[$scope]:-}" ]]; then
+    DB_SCOPE_SEEN["$scope"]=1
+    DB_SCOPE_ORDER+=("$scope")
+  fi
+  map_key="$scope|$key"
+  DB_VALUE["$map_key"]="$value"
+  DB_FILE["$map_key"]="$file"
+  DB_LINE["$map_key"]="$line"
+  DB_PHASE["$map_key"]="$phase"
+  DB_SOURCE["$map_key"]="$source"
+  DB_EVIDENCE["$map_key"]="$evidence"
+}
+
+record_db_var_assignment() {
+  local name="$1" value="$2" file="$3" line="$4" phase="$5" source="$6" evidence="$7"
+  local key scope
+  key="$(db_setting_key_for_var "$name")"
+  [[ -z "$key" ]] && return 0
+  scope="$(db_scope_for_var "$name")"
+  if [[ -n "$value" && "$value" != '""' && "$value" != "''" ]]; then
+    DB_ENV_VALUE["$name"]="$value"
+  fi
+  add_db_setting_record "$scope" "$key" "$value" "$file" "$line" "$phase" "$source variable $name" "$evidence"
+}
+
+mask_db_secret() {
+  local value="$1"
+  if [[ -z "$value" || "$value" == "(empty)" ]]; then
+    printf '(not configured)'
+  else
+    printf 'configured(masked)'
+  fi
+}
+
+mask_db_url() {
+  local value="$1"
+  sed -E 's#(//[^:/@]+:)[^@/]+@#\1****@#g; s#([?&]password=)[^&]+#\1****#Ig' <<< "$value"
+}
+
+db_lookup_value() {
+  local name="$1" default="${2:-}" value=""
+  if [[ -n "$name" && -v $name ]]; then
+    value="${!name}"
+  elif [[ -n "${DB_ENV_VALUE[$name]:-}" && "${DB_ENV_VALUE[$name]}" != *'$'* ]]; then
+    value="${DB_ENV_VALUE[$name]}"
+  elif [[ -n "${DOCKER_ENV[$name]:-}" && "${DOCKER_ENV[$name]}" != *'$'* ]]; then
+    value="${DOCKER_ENV[$name]}"
+  elif [[ "$default" == \?* ]]; then
+    value=""
+  else
+    value="$default"
+  fi
+  printf '%s' "$value"
+}
+
+resolve_db_value() {
+  local value="$1" out match name default replacement
+  out="$value"
+  while [[ "$out" =~ \$\{env\.([A-Za-z_][A-Za-z0-9_]*)(:([^}]*))?\} ]]; do
+    match="${BASH_REMATCH[0]}"
+    name="${BASH_REMATCH[1]}"
+    default="${BASH_REMATCH[3]:-}"
+    replacement="$(db_lookup_value "$name" "$default")"
+    [[ "$replacement" == "$match" ]] && break
+    out="${out//"$match"/$replacement}"
+  done
+  while [[ "$out" =~ \$\{([A-Za-z_][A-Za-z0-9_]*)(:-?([^}]*))?\} ]]; do
+    match="${BASH_REMATCH[0]}"
+    name="${BASH_REMATCH[1]}"
+    default="${BASH_REMATCH[3]:-}"
+    replacement="$(db_lookup_value "$name" "$default")"
+    [[ "$replacement" == "$match" ]] && break
+    out="${out//"$match"/$replacement}"
+  done
+  while [[ "$out" =~ \$([A-Za-z_][A-Za-z0-9_]*) ]]; do
+    match="${BASH_REMATCH[0]}"
+    name="${BASH_REMATCH[1]}"
+    replacement="$(db_lookup_value "$name" "")"
+    [[ -z "$replacement" ]] && break
+    out="${out//"$match"/$replacement}"
+  done
+  printf '%s' "$out"
+}
+
 compact_output() {
   local s="$1"
   s="${s//$'\r'/ }"
@@ -711,6 +898,117 @@ infer_db_driver_vendor() {
     *terajdbc*|*tdgssconfig*|*teradata*) printf 'Teradata JDBC driver' ;;
     *) printf '' ;;
   esac
+}
+
+is_mysql_jdbc_url() {
+  local url
+  url="$(lower "$1")"
+  [[ "$url" =~ ^jdbc:(mysql|mariadb): ]]
+}
+
+parse_mysql_jdbc_url() {
+  local url="$1" rest hostpart path first_host
+  PARSED_DB_HOST=""
+  PARSED_DB_PORT="3306"
+  PARSED_DB_NAME=""
+  if [[ "$url" =~ ^jdbc:(mysql|mariadb):([^/]+:)?//(.+)$ ]]; then
+    rest="${BASH_REMATCH[3]}"
+  elif [[ "$url" =~ ^mysql://(.+)$ ]]; then
+    rest="${BASH_REMATCH[1]}"
+  else
+    return 1
+  fi
+  rest="${rest%%\?*}"
+  if [[ "$rest" == *"@"* ]]; then
+    rest="${rest#*@}"
+  fi
+  hostpart="${rest%%/*}"
+  path=""
+  [[ "$rest" == */* ]] && path="${rest#*/}"
+  first_host="${hostpart%%,*}"
+  if [[ "$first_host" == \[*\]* ]]; then
+    PARSED_DB_HOST="${first_host%%]*}"
+    PARSED_DB_HOST="${PARSED_DB_HOST#[}"
+    if [[ "$first_host" == *"]:"* ]]; then
+      PARSED_DB_PORT="${first_host##*:}"
+    fi
+  else
+    PARSED_DB_HOST="${first_host%%:*}"
+    if [[ "$first_host" == *":"* ]]; then
+      PARSED_DB_PORT="${first_host##*:}"
+    fi
+  fi
+  PARSED_DB_NAME="${path%%/*}"
+  PARSED_DB_NAME="${PARSED_DB_NAME%%\?*}"
+  [[ -n "$PARSED_DB_HOST" ]]
+}
+
+aurora_mysql_assessment() {
+  local host="$1" url="$2" text
+  text="$(lower "$host $url")"
+  if [[ "$text" == *".cluster-"*"rds.amazonaws.com"* || "$text" == *".cluster-ro-"*"rds.amazonaws.com"* || "$text" == *"aurora"* ]]; then
+    printf 'Aurora MySQL endpoint likely'
+  elif [[ "$text" == *"rds.amazonaws.com"* ]]; then
+    printf 'AWS RDS MySQL-compatible endpoint; Aurora not clear'
+  elif [[ -n "$host" ]]; then
+    printf 'Not an AWS Aurora/RDS-looking endpoint'
+  else
+    printf 'No host detected'
+  fi
+}
+
+add_db_check_record() {
+  local scope="$1" source="$2" file="$3" line="$4" url="$5" host="$6" port="$7" database="$8" user="$9" password_status="${10}" aurora="${11}" query="${12}" result="${13}" severity="${14}" message="${15}" suggestion="${16}"
+  [[ -z "$line" || "$line" == "0" ]] && line="-"
+  DB_CHECK_SCOPE+=("$scope")
+  DB_CHECK_SOURCE+=("$source")
+  DB_CHECK_FILE+=("$file")
+  DB_CHECK_LINE+=("$line")
+  DB_CHECK_URL+=("$url")
+  DB_CHECK_HOST+=("$host")
+  DB_CHECK_PORT+=("$port")
+  DB_CHECK_DATABASE+=("$database")
+  DB_CHECK_USER+=("$user")
+  DB_CHECK_PASSWORD_STATUS+=("$password_status")
+  DB_CHECK_AURORA+=("$aurora")
+  DB_CHECK_QUERY+=("$query")
+  DB_CHECK_RESULT+=("$result")
+  DB_CHECK_SEVERITY+=("$severity")
+  DB_CHECK_MESSAGE+=("$message")
+  DB_CHECK_SUGGESTION+=("$suggestion")
+}
+
+mysql_client_command() {
+  if [[ -n "$DB_PROBE_CLIENT" ]]; then
+    printf '%s' "$DB_PROBE_CLIENT"
+  elif command -v mysql >/dev/null 2>&1; then
+    command -v mysql
+  elif command -v mariadb >/dev/null 2>&1; then
+    command -v mariadb
+  else
+    printf ''
+  fi
+}
+
+run_mysql_probe_query() {
+  local client="$1" host="$2" port="$3" database="$4" user="$5" password="$6" query="$7"
+  local -a cmd=()
+  local output rc
+  DB_PROBE_OUTPUT=""
+  DB_PROBE_RC=0
+  cmd=("$client" "--protocol=TCP" "--connect-timeout=$DB_PROBE_TIMEOUT" "-h" "$host" "-P" "$port" "-u" "$user" "${DB_PROBE_CLIENT_OPTIONS[@]}" "--batch" "--skip-column-names")
+  [[ -n "$database" ]] && cmd+=("$database")
+  cmd+=("-e" "$query")
+  if command -v timeout >/dev/null 2>&1; then
+    output="$(MYSQL_PWD="$password" timeout "$DB_PROBE_TIMEOUT" "${cmd[@]}" 2>&1)"
+    rc=$?
+  else
+    output="$(MYSQL_PWD="$password" "${cmd[@]}" 2>&1)"
+    rc=$?
+  fi
+  DB_PROBE_OUTPUT="$output"
+  DB_PROBE_RC="$rc"
+  return "$rc"
 }
 
 infer_version_from_filename() {
@@ -1146,6 +1444,46 @@ parse_args() {
         CONTAINER_CHECK_REPORT_ENABLED=1
         shift 2
         ;;
+      --db-check-output)
+        [[ $# -ge 2 ]] || die "$1 requires a file"
+        DB_CHECK_REPORT_FILE="$2"
+        DB_CHECK_REPORT_ENABLED=1
+        shift 2
+        ;;
+      --db-probe|--aurora-mysql-probe)
+        DB_PROBE_ENABLED=1
+        DB_CHECK_REPORT_ENABLED=1
+        shift
+        ;;
+      --db-probe-timeout)
+        [[ $# -ge 2 ]] || die "$1 requires seconds"
+        [[ "$2" =~ ^[0-9]+$ ]] || die "$1 requires a positive integer"
+        DB_PROBE_TIMEOUT="$2"
+        DB_PROBE_ENABLED=1
+        DB_CHECK_REPORT_ENABLED=1
+        shift 2
+        ;;
+      --db-probe-query)
+        [[ $# -ge 2 ]] || die "$1 requires SQL"
+        DB_PROBE_QUERY="$2"
+        DB_PROBE_ENABLED=1
+        DB_CHECK_REPORT_ENABLED=1
+        shift 2
+        ;;
+      --db-probe-client)
+        [[ $# -ge 2 ]] || die "$1 requires a mysql/mariadb client command"
+        DB_PROBE_CLIENT="$2"
+        DB_PROBE_ENABLED=1
+        DB_CHECK_REPORT_ENABLED=1
+        shift 2
+        ;;
+      --db-probe-client-option)
+        [[ $# -ge 2 ]] || die "$1 requires a mysql/mariadb client option"
+        DB_PROBE_CLIENT_OPTIONS+=("$2")
+        DB_PROBE_ENABLED=1
+        DB_CHECK_REPORT_ENABLED=1
+        shift 2
+        ;;
       --runtime-probe)
         RUNTIME_PROBE_ENABLED=1
         shift
@@ -1290,6 +1628,14 @@ parse_args() {
         ;;
       --no-container-check-output)
         CONTAINER_CHECK_REPORT_ENABLED=0
+        shift
+        ;;
+      --no-db-check-output)
+        DB_CHECK_REPORT_ENABLED=0
+        shift
+        ;;
+      --no-db-probe)
+        DB_PROBE_ENABLED=0
         shift
         ;;
       --no-runtime-probe)
@@ -1875,6 +2221,7 @@ parse_env_instruction() {
       DOCKER_ENV["$key"]="$value"
       DOCKER_ENV_LINE["$key"]="$line"
       add_var_record "$key" "Dockerfile ENV" "define" "$DOCKERFILE_PATH" "$line" "$value" "build:dockerfile" "Legacy ENV key value form; exported into the image environment."
+      record_db_var_assignment "$key" "$value" "$DOCKERFILE_PATH" "$line" "build:dockerfile" "Dockerfile ENV" "$body"
       if should_report_docker_env_for_ecs "$key"; then
         if [[ -z "$value" || "$value" == '""' || "$value" == "''" ]]; then
           add_ecs_env_record "$key" "required_or_expected" "Dockerfile ENV empty/defaultless" "$DOCKERFILE_PATH" "$line" "$value" "" "Dockerfile defines this ENV as empty, so ECS task definition likely needs to provide the runtime value." "$body"
@@ -1908,6 +2255,7 @@ parse_env_instruction() {
     DOCKER_ENV["$key"]="$value"
     DOCKER_ENV_LINE["$key"]="$line"
     add_var_record "$key" "Dockerfile ENV" "define" "$DOCKERFILE_PATH" "$line" "$value" "build:dockerfile" "ENV value exported into the image environment."
+    record_db_var_assignment "$key" "$value" "$DOCKERFILE_PATH" "$line" "build:dockerfile" "Dockerfile ENV" "$word"
     if should_report_docker_env_for_ecs "$key"; then
       if [[ -z "$value" || "$value" == '""' || "$value" == "''" ]]; then
         add_ecs_env_record "$key" "required_or_expected" "Dockerfile ENV empty/defaultless" "$DOCKERFILE_PATH" "$line" "$value" "" "Dockerfile defines this ENV as empty, so ECS task definition likely needs to provide the runtime value." "$word"
@@ -2612,6 +2960,7 @@ scan_shell_file() {
       else
         add_var_record "$var" "Shell variable" "assign" "$file" "$no" "$value" "runtime:$rel" "Assigned in shell script."
       fi
+      record_db_var_assignment "$var" "$value" "$file" "$no" "runtime:$rel" "shell assignment" "$code"
       case "$var" in
         JAVA_VERSION|JDK_VERSION)
           add_software_record "Java" "java-version-shell-variable" "$value" "shell variable $var" "runtime:$rel" "$file" "$no" "$code" "Java version configured in shell script."
@@ -3013,13 +3362,26 @@ jboss_setting_severity() {
 
 record_jboss_cli_setting() {
   local subsystem="$1" resource="$2" operation="$3" key="$4" value="$5" file="$6" line="$7" phase="$8" evidence="$9"
-  local component setting
+  local component setting db_key
   [[ -z "$subsystem" || -z "$key" ]] && return 0
   component="$subsystem"
   [[ -n "$resource" ]] && component="$component/$resource"
   setting="$subsystem.$key"
   [[ -n "$resource" ]] && setting="$subsystem.$resource.$key"
   add_config_record "WildFly/JBoss CLI" "$component" "$setting" "$(jboss_setting_description "$subsystem" "$key")" "$value" "$(jboss_setting_recommendation "$subsystem" "$key" "$resource")" "$(jboss_setting_distance "$subsystem" "$key" "$value")" "$(jboss_setting_severity "$subsystem" "$key" "$value")" "$phase" "$file" "$line" "$evidence"
+  if [[ "$subsystem" == "datasources" ]]; then
+    case "$key" in
+      connection-url) db_key="url" ;;
+      user-name) db_key="user" ;;
+      password) db_key="password" ;;
+      jndi-name) db_key="jndi" ;;
+      driver-name|driver-module-name|driver-class-name|driver-xa-datasource-class-name) db_key="driver" ;;
+      *) db_key="" ;;
+    esac
+    if [[ -n "$db_key" ]]; then
+      add_db_setting_record "jboss-cli:$component" "$db_key" "$value" "$file" "$line" "$phase" "WildFly/JBoss CLI $component $key" "$evidence"
+    fi
+  fi
 }
 
 scan_jboss_cli_settings() {
@@ -3538,6 +3900,96 @@ run_eap_startup_probe() {
   fi
 }
 
+run_db_connectivity_checks() {
+  (( DB_CHECK_REPORT_ENABLED || DB_PROBE_ENABLED )) || return 0
+  local scope url host port database user password source file line aurora client output msg suggestion
+  local raw_url raw_host raw_port raw_database raw_user raw_password
+  local password_status result severity
+
+  if (( ${#DB_SCOPE_ORDER[@]} == 0 )); then
+    if (( DB_PROBE_ENABLED )); then
+      add_finding "WARN" "db-probe" "$DOCKERFILE_PATH" "-" "DB001" "Aurora MySQL DB probe was requested, but no DB connection settings were detected in Dockerfile, shell scripts, or JBoss CLI files."
+    fi
+    add_db_check_record "-" "-" "$DOCKERFILE_PATH" "-" "" "" "" "" "" "(not configured)" "No DB settings detected" "$DB_PROBE_QUERY" "NO_CANDIDATE" "INFO" "No DB connection settings were detected in Dockerfile, shell scripts, or JBoss CLI files." "Define or expose JDBC URL/host/user/password settings, then rerun with --db-probe."
+    return 0
+  fi
+
+  progress_log "DB-PROBE" "Preparing Aurora MySQL DB connectivity candidates"
+  client="$(mysql_client_command)"
+
+  for scope in "${DB_SCOPE_ORDER[@]}"; do
+    raw_url="${DB_VALUE[$scope|url]:-}"
+    raw_host="${DB_VALUE[$scope|host]:-}"
+    raw_port="${DB_VALUE[$scope|port]:-}"
+    raw_database="${DB_VALUE[$scope|database]:-}"
+    raw_user="${DB_VALUE[$scope|user]:-}"
+    raw_password="${DB_VALUE[$scope|password]:-}"
+
+    url="$(resolve_db_value "$raw_url")"
+    host="$(resolve_db_value "$raw_host")"
+    port="$(resolve_db_value "$raw_port")"
+    database="$(resolve_db_value "$raw_database")"
+    user="$(resolve_db_value "$raw_user")"
+    password="$(resolve_db_value "$raw_password")"
+    [[ -z "$port" ]] && port="3306"
+
+    file="${DB_FILE[$scope|url]:-${DB_FILE[$scope|host]:-$DOCKERFILE_PATH}}"
+    line="${DB_LINE[$scope|url]:-${DB_LINE[$scope|host]:--}}"
+    source="${DB_SOURCE[$scope|url]:-${DB_SOURCE[$scope|host]:-$scope}}"
+
+    if [[ -n "$url" ]]; then
+      if ! is_mysql_jdbc_url "$url" && [[ "$(lower "$url")" != mysql://* ]]; then
+        aurora="$(aurora_mysql_assessment "$host" "$url")"
+        add_db_check_record "$scope" "$source" "$file" "$line" "$(mask_db_url "$url")" "$host" "$port" "$database" "$user" "$(mask_db_secret "$password")" "$aurora" "$DB_PROBE_QUERY" "SKIPPED" "WARN" "DB candidate is not a MySQL/MariaDB JDBC URL, so Aurora MySQL probe was skipped." "Use jdbc:mysql://host:3306/database or provide DB_HOST/DB_PORT/DB_NAME style values for Aurora MySQL."
+        (( DB_PROBE_ENABLED )) && add_finding "WARN" "db-probe" "$file" "$line" "DB007" "DB candidate '$scope' is not a MySQL/MariaDB JDBC URL for Aurora MySQL: $(mask_db_url "$url")"
+        continue
+      fi
+      if parse_mysql_jdbc_url "$url"; then
+        [[ -z "$host" ]] && host="$PARSED_DB_HOST"
+        [[ -z "$port" || "$port" == "3306" ]] && port="$PARSED_DB_PORT"
+        [[ -z "$database" ]] && database="$PARSED_DB_NAME"
+      fi
+    fi
+
+    aurora="$(aurora_mysql_assessment "$host" "$url")"
+    password_status="$(mask_db_secret "$password")"
+
+    if [[ -z "$host" || -z "$user" ]]; then
+      msg="DB candidate lacks required host or user information after resolving Dockerfile/shell/JBoss CLI values. host=${host:-missing}, user=${user:-missing}."
+      add_db_check_record "$scope" "$source" "$file" "$line" "$(mask_db_url "$url")" "$host" "$port" "$database" "$user" "$password_status" "$aurora" "$DB_PROBE_QUERY" "INCOMPLETE" "WARN" "$msg" "Set JDBC URL/host and user in Dockerfile, shell environment, JBoss CLI datasource, or current environment variables referenced by those files."
+      (( DB_PROBE_ENABLED )) && add_finding "WARN" "db-probe" "$file" "$line" "DB002" "$msg"
+      continue
+    fi
+
+    if (( ! DB_PROBE_ENABLED )); then
+      add_db_check_record "$scope" "$source" "$file" "$line" "$(mask_db_url "$url")" "$host" "$port" "$database" "$user" "$password_status" "$aurora" "$DB_PROBE_QUERY" "NOT_RUN" "INFO" "DB connection candidate was detected, but --db-probe was not enabled." "Run with --db-probe when the local environment can reach the Aurora MySQL endpoint and has credentials."
+      continue
+    fi
+
+    if [[ -z "$client" ]]; then
+      msg="Aurora MySQL DB probe requires mysql or mariadb client, but neither was found in PATH."
+      add_db_check_record "$scope" "$source" "$file" "$line" "$(mask_db_url "$url")" "$host" "$port" "$database" "$user" "$password_status" "$aurora" "$DB_PROBE_QUERY" "CLIENT_MISSING" "WARN" "$msg" "Install mysql/mariadb client or pass --db-probe-client /path/to/mysql."
+      add_finding "WARN" "db-probe" "$file" "$line" "DB004" "$msg"
+      continue
+    fi
+
+    progress_log "DB-PROBE" "Running Aurora MySQL query for $scope at $host:$port"
+    if run_mysql_probe_query "$client" "$host" "$port" "$database" "$user" "$password" "$DB_PROBE_QUERY"; then
+      output="$(compact_output "$DB_PROBE_OUTPUT")"
+      [[ -z "$output" ]] && output="query returned success with no output"
+      msg="Aurora MySQL DB probe succeeded. Output: $output"
+      add_db_check_record "$scope" "$source" "$file" "$line" "$(mask_db_url "$url")" "$host" "$port" "$database" "$user" "$password_status" "$aurora" "$DB_PROBE_QUERY" "SUCCESS" "INFO" "$msg" "Keep this result as connectivity evidence for the detected Aurora MySQL datasource."
+      add_finding "INFO" "db-probe" "$file" "$line" "DB005" "$msg"
+    else
+      output="$(compact_output "$DB_PROBE_OUTPUT")"
+      msg="Aurora MySQL DB probe failed with rc=$DB_PROBE_RC. Output: $output"
+      suggestion="Check VPC/VPN/routing/security group, Aurora endpoint/port, database name, username/password, SSL requirements, and whether the detected values were resolved from environment variables correctly."
+      add_db_check_record "$scope" "$source" "$file" "$line" "$(mask_db_url "$url")" "$host" "$port" "$database" "$user" "$password_status" "$aurora" "$DB_PROBE_QUERY" "FAILED" "ERROR" "$msg" "$suggestion"
+      add_finding "ERROR" "db-probe" "$file" "$line" "DB006" "$msg"
+    fi
+  done
+}
+
 report_unused_context_files() {
   local full rel
   progress_log "CHECK" "Scanning unreferenced build-context files"
@@ -3562,6 +4014,7 @@ check_item_for_code() {
     KSH*) printf 'ksh setup consistency' ;;
     RTP*) printf 'Docker runtime executable probe' ;;
     EAP*) printf 'JBoss EAP startup probe' ;;
+    DB*) printf 'Aurora MySQL DB connectivity probe' ;;
     UBI*) printf 'UBI 9.6 runtime consistency' ;;
     CLI*) printf 'WildFly jboss-cli syntax' ;;
     JNDI*) printf 'WildFly JNDI configuration' ;;
@@ -3640,6 +4093,12 @@ suggestion_for_code() {
     EAP013) printf 'Docker permission error could not be solved by sudo -n. Add the user to the docker group, configure passwordless sudo for docker, or run the checker with appropriate privileges.' ;;
     EAP014) printf 'Select a runnable EAP probe target: use --eap-startup-target build, --eap-startup-from-base when the final FROM resolves to an external image, or --eap-startup-run-image IMAGE for a prebuilt image.' ;;
     EAP015) printf 'The probe is intentionally running an existing/base image and skipping docker build. Use --eap-startup-command if the image has no default CMD that starts JBoss EAP.' ;;
+    DB001) printf 'Dockerfile、シェル、JBoss CLIにAurora MySQL接続情報が検出されません。JDBC URLまたはDB_HOST/DB_USER等の変数を確認してください。' ;;
+    DB002) printf 'DB接続に必要なhost/userなどが不足しています。環境変数参照の場合はローカル環境にも値を設定してから --db-probe を再実行してください。' ;;
+    DB004) printf 'mysqlまたはmariadbクライアントを導入するか、--db-probe-clientでクライアントパスを指定してください。' ;;
+    DB005) printf 'Aurora MySQLへの簡易接続クエリは成功しました。接続証跡としてDBチェックCSVを保管してください。' ;;
+    DB006) printf 'Auroraのエンドポイント、ポート、DB名、認証情報、SSL要件、Security Group、VPN/VPC経路を確認してください。' ;;
+    DB007) printf 'Aurora MySQL検証対象にする場合は jdbc:mysql://host:3306/db 形式、またはDB_HOST/DB_PORT/DB_NAME等で接続先を定義してください。' ;;
     UBI001|UBI002) printf 'RHEL/UBI 9.6前提ならベースイメージタグを9.6に固定してください。' ;;
     UBI003|UBI004) printf 'UBI minimalではmicrodnf利用とキャッシュ削除を確認してください。パッケージ導入はDockerfileビルド時に寄せるのが基本です。' ;;
     UBI005|UBI012) printf 'subscription-managerに依存しない構成へ見直してください。UBIコンテナはホスト購読状態へ依存させない方が移植性があります。' ;;
@@ -3759,6 +4218,7 @@ write_report_file() {
   write_summary_csv_row serial "ksh setup consistency" "KSH"
   write_summary_csv_row serial "Docker runtime executable probe" "RTP"
   write_summary_csv_row serial "JBoss EAP startup probe" "EAP"
+  write_summary_csv_row serial "Aurora MySQL DB connectivity probe" "DB"
   write_summary_csv_row serial "WildFly jboss-cli構文" "CLI"
   write_summary_csv_row serial "WildFly JNDI設定" "JNDI"
   write_summary_csv_row serial "UBI 9.6 runtime整合性" "UBI"
@@ -4085,6 +4545,39 @@ write_container_check_report_file() {
   fi
 }
 
+write_db_check_report_file() {
+  (( DB_CHECK_REPORT_ENABLED )) || return 0
+  local dir i file url host port database user
+  dir="$(dirname -- "$DB_CHECK_REPORT_FILE")"
+  mkdir -p -- "$dir"
+  progress_log "OUTPUT" "Writing Excel DB connectivity check CSV: $DB_CHECK_REPORT_FILE"
+  printf '\xEF\xBB\xBF' > "$DB_CHECK_REPORT_FILE"
+  write_csv_row_to_file "$DB_CHECK_REPORT_FILE" \
+    "No" "Scope" "Source" "File" "Line" "JdbcUrl" "Host" "Port" "Database" "User" "PasswordStatus" "AuroraMySQLAssessment" "ProbeQuery" "Result" "Severity" "Message" "Suggestion"
+
+  if (( ${#DB_CHECK_SCOPE[@]} == 0 )); then
+    write_csv_row_to_file "$DB_CHECK_REPORT_FILE" \
+      "1" "-" "-" "-" "-" "-" "-" "-" "-" "-" "(not configured)" "No DB settings detected" "$DB_PROBE_QUERY" "NO_CANDIDATE" "INFO" "No DB connectivity candidates were built." "Define DB connection settings or run with --db-probe after the checker can detect them."
+    return 0
+  fi
+
+  for ((i=0; i<${#DB_CHECK_SCOPE[@]}; i++)); do
+    file="$(display_path "${DB_CHECK_FILE[$i]}")"
+    url="${DB_CHECK_URL[$i]}"
+    host="${DB_CHECK_HOST[$i]}"
+    port="${DB_CHECK_PORT[$i]}"
+    database="${DB_CHECK_DATABASE[$i]}"
+    user="${DB_CHECK_USER[$i]}"
+    [[ -z "$url" ]] && url="-"
+    [[ -z "$host" ]] && host="-"
+    [[ -z "$port" ]] && port="-"
+    [[ -z "$database" ]] && database="-"
+    [[ -z "$user" ]] && user="-"
+    write_csv_row_to_file "$DB_CHECK_REPORT_FILE" \
+      "$((i + 1))" "${DB_CHECK_SCOPE[$i]}" "${DB_CHECK_SOURCE[$i]}" "$file" "${DB_CHECK_LINE[$i]}" "$url" "$host" "$port" "$database" "$user" "${DB_CHECK_PASSWORD_STATUS[$i]}" "${DB_CHECK_AURORA[$i]}" "${DB_CHECK_QUERY[$i]}" "${DB_CHECK_RESULT[$i]}" "${DB_CHECK_SEVERITY[$i]}" "${DB_CHECK_MESSAGE[$i]}" "${DB_CHECK_SUGGESTION[$i]}"
+  done
+}
+
 print_header() {
   local stages stage_label
   stages=$((FINAL_STAGE + 1))
@@ -4130,11 +4623,17 @@ print_header() {
   if (( CONTAINER_CHECK_REPORT_ENABLED )); then
     printf 'Container  : %s\n' "$CONTAINER_CHECK_REPORT_FILE"
   fi
+  if (( DB_CHECK_REPORT_ENABLED )); then
+    printf 'DB checks  : %s\n' "$DB_CHECK_REPORT_FILE"
+  fi
   if (( RUNTIME_PROBE_ENABLED )); then
     printf 'Docker run : runtime probe enabled, image=%s\n' "${RUNTIME_PROBE_IMAGE:-auto}"
   fi
   if (( EAP_STARTUP_PROBE_ENABLED )); then
     printf 'EAP probe  : enabled, target=%s, image=%s, timeout=%ss\n' "$EAP_STARTUP_TARGET" "${EAP_STARTUP_RUN_IMAGE:-${EAP_STARTUP_IMAGE:-auto}}" "$EAP_STARTUP_TIMEOUT"
+  fi
+  if (( DB_PROBE_ENABLED )); then
+    printf 'DB probe   : enabled, query=%s, timeout=%ss\n' "$DB_PROBE_QUERY" "$DB_PROBE_TIMEOUT"
   fi
   printf '\n'
 }
@@ -4207,6 +4706,10 @@ main() {
     [[ -z "$CONTAINER_CHECK_REPORT_FILE" ]] && CONTAINER_CHECK_REPORT_FILE="$PWD/docker-context-checker-container-checks.csv"
     CONTAINER_CHECK_REPORT_FILE="$(abs_path "$CONTAINER_CHECK_REPORT_FILE")"
   fi
+  if (( DB_CHECK_REPORT_ENABLED )); then
+    [[ -z "$DB_CHECK_REPORT_FILE" ]] && DB_CHECK_REPORT_FILE="$PWD/docker-context-checker-db-checks.csv"
+    DB_CHECK_REPORT_FILE="$(abs_path "$DB_CHECK_REPORT_FILE")"
+  fi
 
   progress_log "START" "Context=$CONTEXT_DIR Dockerfile=$DOCKERFILE_PATH"
   progress_log "CHECK" "Loading .dockerignore patterns"
@@ -4227,6 +4730,9 @@ main() {
     if (( EAP_STARTUP_PROBE_ENABLED )); then
       run_eap_startup_probe
     fi
+    if (( DB_CHECK_REPORT_ENABLED || DB_PROBE_ENABLED )); then
+      run_db_connectivity_checks
+    fi
   fi
   progress_log "DONE" "Checks completed"
   write_report_file
@@ -4237,6 +4743,7 @@ main() {
   write_config_report_file
   write_ecs_env_report_file
   write_container_check_report_file
+  write_db_check_report_file
   print_report
 
   case "$FAIL_ON" in
